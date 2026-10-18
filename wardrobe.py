@@ -21,7 +21,7 @@ def schema_diagnostic(node, stage):
                               and re.fullmatch(r"[A-Za-z_]{1,40}", k))[:25]) if isinstance(value, dict) else "not_object"
     data = node.get("data") if isinstance(node, dict) else None
     relations = node.get("relations") if isinstance(node, dict) else None
-    LOG.warning("Wardrobe schema: parser=v11.2 stage=%s node_fields=%s data_fields=%s relation_fields=%s",
+    LOG.warning("Wardrobe schema: parser=v11.3 stage=%s node_fields=%s data_fields=%s relation_fields=%s",
                 stage, fields(node), fields(data), fields(relations))
 
 
@@ -92,6 +92,42 @@ def collection_node(payload, path):
     raise OutfitError("unsupported_outfit_collection")
 
 
+async def outfit_card(api, reference, nodes, uid, target):
+    """Dereference collection edges and fetch incomplete cards, with a hop cap."""
+    current = reference
+    visited = {current}
+    fetched = set()
+    node = nodes.get(current, {})
+    for _ in range(16):
+        data = node.get("data") if isinstance(node, dict) else None
+        name = card_name(data)
+        if name is not None and (name.strip().casefold() != target or
+                (isinstance(data.get("pids"), list) and data["pids"])):
+            return node
+        relations = node.get("relations", {}) if isinstance(node, dict) else {}
+        ref = relations.get("ref") if isinstance(relations, dict) else None
+        if isinstance(ref, dict):
+            ref = ref.get("id")
+        if ref is not None:
+            outfit_path(ref, uid)  # same authenticated API and allowed outfit paths only
+            if ref in visited:
+                raise OutfitError("outfit_reference_cycle")
+            visited.add(ref)
+            current = ref
+            node = nodes.get(current, {})
+            continue
+        if current in fetched:
+            schema_diagnostic(node, "full_card_incomplete")
+            raise OutfitError("unsupported_outfit_fields")
+        fetched.add(current)
+        detail = await api("GET", outfit_path(current, uid))
+        detail_nodes = detail.get("denormalized", {}) if isinstance(detail, dict) else {}
+        if isinstance(detail_nodes, dict):
+            nodes.update(detail_nodes)
+        node = resolved_node(detail, current, uid)
+    raise OutfitError("outfit_reference_limit_reached")
+
+
 async def load_named_outfit(api, uid, name="Bot"):
     """Use the caller's authenticated API session; never another user's wardrobe.
 
@@ -102,7 +138,7 @@ async def load_named_outfit(api, uid, name="Bot"):
     if not re.fullmatch(r"\d+", uid) or not isinstance(name, str) or not name.strip():
         raise OutfitError("invalid_outfit_selection")
     target = name.strip().casefold()
-    LOG.info("Wardrobe parser v11.2: looking up the configured saved outfit")
+    LOG.info("Wardrobe parser v11.3: looking up the configured saved outfit; following ref relations")
     path = f"/user/user-{uid}/outfits"
     seen = set()
     selected = None
@@ -112,25 +148,14 @@ async def load_named_outfit(api, uid, name="Bot"):
         new_count = 0
         for item in items:
             reference = item.get("id") if isinstance(item, dict) else item
-            detail_path = outfit_path(reference, uid)
+            outfit_path(reference, uid)
             if reference in seen:
                 continue
             seen.add(reference)
             new_count += 1
-            node = nodes.get(reference, {})
-            data = node.get("data") if isinstance(node, dict) else None
-            current_name = card_name(data)
-            # A collection can denormalize a partial record. A data block alone
-            # doesn't mean the full outfit card has been fetched.
-            need_detail = current_name is None or (current_name.strip().casefold() == target
-                           and (not isinstance(data.get("pids"), list) or not data["pids"]))
-            if need_detail:
-                detail = await api("GET", detail_path)
-                node = resolved_node(detail, reference, uid)
+            node = await outfit_card(api, reference, nodes, uid, target)
             if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
                 schema_diagnostic(node, "detail_node_missing")
-                if need_detail:
-                    schema_diagnostic(detail, "detail_envelope")
                 raise OutfitError("unsupported_outfit_fields")
             data = node.get("data", {})
             # The TS wrapper exposes outfitName, but its serializer maps this
