@@ -55,7 +55,7 @@ def collection_node(payload, path):
 async def load_named_outfit(api, uid, name="Bot"):
     """Use the caller's authenticated API session; never another user's wardrobe.
 
-    Observed client schema: /user/user-{own_id}/outfits; outfitName and pids.
+    Raw API schema: /user/user-{own_id}/outfits; outfit_name and pids.
     No purchase, rename, profile mutation, or default outfit is performed here.
     """
     uid = str(uid)
@@ -84,7 +84,9 @@ async def load_named_outfit(api, uid, name="Bot"):
             if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
                 raise OutfitError("unsupported_outfit_fields")
             data = node.get("data", {})
-            outfit_name = data.get("outfitName", data.get("name"))
+            # The TS wrapper exposes outfitName, but its serializer maps this
+            # property to outfit_name on the wire. Read the raw API field first.
+            outfit_name = data.get("outfit_name", data.get("outfitName", data.get("name")))
             if not isinstance(outfit_name, str):
                 raise OutfitError("unsupported_outfit_fields")
             if outfit_name.strip().casefold() != target:
