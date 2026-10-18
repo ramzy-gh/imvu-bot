@@ -1,4 +1,4 @@
-"""RAMSEI v8: bilingual chat, AI diagnostics and saved avatar appearance."""
+"""RAMSEI v9: Groq chat and refreshed account-saved outfit appearance."""
 import asyncio
 import base64
 import contextlib
@@ -300,6 +300,7 @@ class Bot:
         self.appearance = {"state": "not_announced", "product_count": 0}
         self.outfit_products = []
         self.last_appearance = 0
+        self.outfit_loaded_at = 0
         self.session = None
         self.op = 0
         self.last_said = 0
@@ -466,17 +467,19 @@ class Bot:
         if time.monotonic() - self.last_appearance < 10:
             return
         try:
-            if not self.outfit_products:
+            if not self.outfit_products or time.monotonic() - self.outfit_loaded_at > 300:
                 profile = await self.api("GET", f"/profile_outfit/profile_outfit-{self.user_id}")
                 self.outfit_products = appearance_products(profile, self.user_id)
+                self.outfit_loaded_at = time.monotonic()
             ids = " ".join(self.outfit_products)
             # Announce only this account's actual saved outfit, under its own identity.
             # No room/global settings, seats, or other avatars are modified.
             await self.say("*putOnOutfit " + ids)
             await self.say("*use " + ids)
             self.last_appearance = time.monotonic()
-            self.appearance = {"state": "announced_not_render_verified", "product_count": len(self.outfit_products)}
-            LOG.info("Saved avatar appearance announced: %s products; client rendering requires visual verification", len(self.outfit_products))
+            self.appearance = {"state": "announced_not_render_verified", "product_count": len(self.outfit_products),
+                               "source": "account_saved_profile_outfit"}
+            LOG.info("Latest account-saved profile outfit announced: %s products; client rendering requires visual verification", len(self.outfit_products))
         except (RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as error:
             self.appearance = {"state": "announcement_failed", "product_count": 0}
             LOG.warning("Avatar appearance could not be announced: %s", type(error).__name__)
@@ -653,6 +656,7 @@ class Bot:
                         await self.packet("msg_c2g_open_floodgates")
                         self.chat_ready = False
                         self.last_appearance = 0
+                        self.outfit_products = []
                         self.pending_chat_ops.clear()
                         for queue in (self.queue, f"inv:/chat/chat-{self.room}"):
                             operation = await self.packet("msg_c2g_subscribe", queues_with_results=[{"record": "subscription", "name": queue, "op_id": self.op + 1}])
