@@ -1,4 +1,4 @@
-"""RAMSEI v6: password-only IMVU login; live validation required."""
+"""RAMSEI v7: password-only login with room-chat diagnostics."""
 import asyncio
 import base64
 import contextlib
@@ -38,6 +38,62 @@ def encode(value):
     return base64.b64encode(json.dumps(value, separators=(",", ":")).encode()).decode()
 
 
+def transport_user_id(value):
+    """IMQ encodes sender IDs as base64; support already-decoded numeric IDs too."""
+    text = str(value)
+    if re.fullmatch(r"\d+", text):
+        return text
+    try:
+        decoded = base64.b64decode(text, validate=True).decode("ascii")
+        return decoded if re.fullmatch(r"\d+", decoded) else None
+    except (ValueError, UnicodeError):
+        return None
+
+
+def participant_ids(data, collection_url):
+    """Read membership from participant nodes and authoritative collection items."""
+    nodes = data.get("denormalized", {})
+    found = set()
+    for url in nodes:
+        match = re.fullmatch(re.escape(collection_url) + r"/user-(\d+)(?:[/?#].*)?", url)
+        if match:
+            found.add(match[1])
+    collection = nodes.get(collection_url, {}).get("data", {})
+    for item in collection.get("items", []):
+        url = item.get("id", "") if isinstance(item, dict) else item
+        if not isinstance(url, str):
+            continue
+        match = re.fullmatch(r"https://api\.imvu\.com/(?:user/|chat/chat-[0-9-]+/participants/)user-(\d+)(?:[/?#].*)?", url)
+        if match:
+            found.add(match[1])
+    return found
+
+
+def rejection_reason(packet, queue, members, own_id):
+    if packet.get("record") != "msg_g2c_send_message":
+        return "not_message"
+    if packet.get("queue") != queue:
+        return "other_queue"
+    if packet.get("mount") != "messages":
+        return "other_mount"
+    try:
+        payload = json.loads(base64.b64decode(packet.get("message", ""), validate=True))
+        if not isinstance(payload, dict):
+            return "payload_not_object"
+        if "userId" not in payload or "message" not in payload:
+            return "payload_fields_changed"
+        sender = str(payload["userId"])
+        if sender == own_id:
+            return "self_message"
+        if sender not in members:
+            return "sender_missing_from_participants"
+        if payload.get("to", 0) not in (0, "0", None):
+            return "private_or_unknown_recipient"
+        return "system_or_sender_validation"
+    except (ValueError, TypeError, UnicodeError):
+        return "payload_encoding_changed"
+
+
 def decode_message(packet, queue, members, own_id):
     """Accept only public messages in the joined queue from present participants."""
     if packet.get("record") != "msg_g2c_send_message" or packet.get("queue") != queue:
@@ -52,7 +108,7 @@ def decode_message(packet, queue, members, own_id):
         text = payload["message"]
         # Bind sender to server identity when IMQ supplies it.
         verified = packet.get("user_id", packet.get("sender_id"))
-        if verified is not None and str(verified) != sender:
+        if verified is not None and transport_user_id(verified) != sender:
             return None
         if sender == own_id or sender not in members or payload.get("to", 0) not in (0, "0", None):
             return None
@@ -214,6 +270,15 @@ class Bot:
         self.status = "starting"
         self.status_message = ""
         self.authenticated = asyncio.Event()
+        self.chat_ready = False
+        self.announced = False
+        self.room_subscription_op = None
+        self.pending_chat_ops = set()
+        self.diagnostics = {"packets_received": 0, "message_packets": 0,
+            "accepted_messages": 0, "commands_received": 0, "messages_sent": 0,
+            "messages_acked": 0, "last_rejection": "none"}
+        self.last_diagnostic = 0
+        self.last_membership_refresh = 0
         self.session = None
         self.op = 0
         self.last_said = 0
@@ -319,7 +384,13 @@ class Bot:
         if self.ws is None or self.ws.closed:
             raise ConnectionError("IMVU chat is disconnected")
         self.op += 1
-        await self.ws.send_json({"record": record, "op_id": self.op, **fields})
+        payload = {"record": record, **fields}
+        # These control records have no top-level operation field in IMQ.
+        # Subscribe acknowledgement IDs live inside queues_with_results instead.
+        if record == "msg_c2g_send_message":
+            payload["op_id"] = self.op
+        await self.ws.send_json(payload)
+        return self.op
 
     async def say(self, text):
         if not self.connected:
@@ -328,19 +399,23 @@ class Bot:
             await asyncio.sleep(max(0, self.last_said + 1.5 - time.monotonic()))
             if not self.connected:
                 return
-            await self.packet("msg_c2g_send_message", queue=self.queue, mount="messages",
+            operation = await self.packet("msg_c2g_send_message", queue=self.queue, mount="messages",
                 message=encode({"chatId": self.queue.rsplit("/", 1)[-1], "message": text[:450],
                                 "to": 0, "userId": self.user_id}))
+            self.pending_chat_ops.add(operation)
+            # Outstanding acknowledgements are diagnostic only; keep memory bounded.
+            if len(self.pending_chat_ops) > 100:
+                self.pending_chat_ops.discard(min(self.pending_chat_ops))
+            self.diagnostics["messages_sent"] += 1
             self.last_said = time.monotonic()
 
     async def participants(self, greet=False):
         path = f"/chat/chat-{self.room}/participants"
         data = await self.api("GET", path)
-        new = set()
-        for url, node in data.get("denormalized", {}).items():
-            match = re.search(r"/participants/user-(\d+)$", url)
-            if match:
-                new.add(match[1])
+        new = participant_ids(data, API + path)
+        self.last_membership_refresh = time.monotonic()
+        if not greet:
+            LOG.info("Membership loaded: %s participants recognized", len(new))
         if greet:
             for uid in sorted(new - self.members - {self.user_id}):
                 now = time.monotonic()
@@ -364,6 +439,15 @@ class Bot:
             await self.api("POST", f"/chat/chat-{self.room}/participants/user-{self.user_id}", json={})
             await self.participants(greet=True)
 
+    async def confirm_chat_ready(self):
+        if self.chat_ready:
+            return
+        self.chat_ready = True
+        LOG.info("Room chat subscription confirmed; checking message delivery")
+        if not self.announced:
+            self.announced = True
+            await self.say("رامسي معاكم يا نجوم! 😎💛 جربوا !help أو !game")
+
     async def receive(self):
         async for message in self.ws:
             if message.type != aiohttp.WSMsgType.TEXT:
@@ -374,14 +458,49 @@ class Bot:
                 packet = json.loads(message.data)
             except ValueError:
                 continue
+            if not isinstance(packet, dict):
+                continue
+            self.diagnostics["packets_received"] += 1
+            operation = packet.get("op_id")
+            if isinstance(operation, str) and operation.isdigit():
+                operation = int(operation)
             if packet.get("record") == "msg_g2c_result" and packet.get("status", 0) != 0:
-                raise RuntimeError("IMVU rejected a chat operation; connector needs live diagnosis.")
+                purpose = "send_chat" if operation in self.pending_chat_ops else "subscribe_or_control"
+                LOG.warning("IMVU rejected operation: purpose=%s status=%s", purpose, packet.get("status"))
+                raise RuntimeError("IMVU rejected a chat operation; see purpose/status diagnostic.")
+            if packet.get("record") == "msg_g2c_result" and packet.get("status") == 0:
+                if operation in self.pending_chat_ops:
+                    self.pending_chat_ops.discard(operation)
+                    self.diagnostics["messages_acked"] += 1
+                    LOG.info("IMVU acknowledged outgoing chat message")
+                if operation == self.room_subscription_op and not self.chat_ready:
+                    await self.confirm_chat_ready()
+            if packet.get("record") == "msg_g2c_create_mount" and packet.get("queue") == self.queue and packet.get("mount") == "messages":
+                await self.confirm_chat_ready()
+            if packet.get("record") == "msg_g2c_send_message":
+                self.diagnostics["message_packets"] += 1
+                if packet.get("queue") == self.queue and packet.get("mount") == "messages":
+                    await self.confirm_chat_ready()
             command = decode_message(packet, self.queue, self.members, self.user_id)
+            if command is None and rejection_reason(packet, self.queue, self.members, self.user_id) == "sender_missing_from_participants":
+                if time.monotonic() - self.last_membership_refresh >= 5:
+                    await self.participants()
+                    command = decode_message(packet, self.queue, self.members, self.user_id)
+            if command is None and packet.get("record") == "msg_g2c_send_message":
+                reason = rejection_reason(packet, self.queue, self.members, self.user_id)
+                if reason != "self_message":
+                    self.diagnostics["last_rejection"] = reason
+                    if time.monotonic() - self.last_diagnostic >= 10:
+                        LOG.info("Chat diagnostic: reason=%s members=%s packets=%s", reason, len(self.members), self.diagnostics["message_packets"])
+                        self.last_diagnostic = time.monotonic()
             if command:
+                self.diagnostics["accepted_messages"] += 1
                 uid, text, verified = command
                 if not self.permissions.allowed(uid):
                     continue
                 if text.startswith("!") and not self.commands.full():
+                    self.diagnostics["commands_received"] += 1
+                    LOG.info("Room command received and queued")
                     self.commands.put_nowait(command)
                 if self.social.interested(text) and not self.social.inbox.full():
                     self.social.inbox.put_nowait((uid, text))
@@ -489,10 +608,14 @@ class Bot:
                         if auth.get("record") != "msg_g2c_result" or auth.get("op_id") != 0 or auth.get("status") != 0:
                             raise RuntimeError("IMQ authentication rejected or response changed.")
                         await self.packet("msg_c2g_open_floodgates")
+                        self.chat_ready = False
+                        self.pending_chat_ops.clear()
                         for queue in (self.queue, f"inv:/chat/chat-{self.room}"):
-                            await self.packet("msg_c2g_subscribe", queues_with_results=[{"record": "subscription", "name": queue, "op_id": self.op + 1}])
+                            operation = await self.packet("msg_c2g_subscribe", queues_with_results=[{"record": "subscription", "name": queue, "op_id": self.op + 1}])
+                            if queue == self.queue:
+                                self.room_subscription_op = operation
                         self.connected = True
-                        LOG.info("Ramsei connected to room %s; live chat validation still required", self.room)
+                        LOG.info("Room transport authenticated for %s; waiting for subscription acknowledgement", self.room)
                         delay = 5
                         tasks = [asyncio.create_task(self.receive()), asyncio.create_task(self.presence())]
                         try:
@@ -501,6 +624,7 @@ class Bot:
                                 task.result()
                         finally:
                             self.connected = False
+                            self.chat_ready = False
                             for task in tasks:
                                 task.cancel()
                             await asyncio.gather(*tasks, return_exceptions=True)
@@ -530,8 +654,11 @@ async def main():
     bot = Bot(radio)
     app = web.Application()
     async def health(request):
-        return web.json_response({"status": "connected" if bot.connected else bot.status,
+        status = "connected" if bot.connected and bot.chat_ready else "transport_connected" if bot.connected else bot.status
+        return web.json_response({"status": status,
             "message": bot.status_message,
+            "chat_ready": bot.chat_ready and bot.connected,
+            "participants_recognized": len(bot.members), "chat_diagnostics": bot.diagnostics,
             "room": bot.room, "playing": radio.current["title"] if radio.current else None,
             "queued": radio.queue.qsize(), "listeners": len(radio.listeners)})
     app.router.add_get("/health", health)
