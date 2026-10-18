@@ -1,7 +1,7 @@
 """Read the authenticated account's named saved outfit, without profile fallback."""
 import re
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 API = "https://api.imvu.com"
 LOG = logging.getLogger("ramsei.wardrobe")
@@ -21,7 +21,7 @@ def schema_diagnostic(node, stage):
                               and re.fullmatch(r"[A-Za-z_]{1,40}", k))[:25]) if isinstance(value, dict) else "not_object"
     data = node.get("data") if isinstance(node, dict) else None
     relations = node.get("relations") if isinstance(node, dict) else None
-    LOG.warning("Wardrobe schema: parser=v11.3 stage=%s node_fields=%s data_fields=%s relation_fields=%s",
+    LOG.warning("Wardrobe schema: parser=v11.4 stage=%s node_fields=%s data_fields=%s relation_fields=%s",
                 stage, fields(node), fields(data), fields(relations))
 
 
@@ -88,8 +88,16 @@ def collection_node(payload, path):
         parsed = urlparse(key)
         if parsed.scheme == "https" and parsed.netloc == "api.imvu.com" and parsed.path == path:
             if isinstance(node, dict) and isinstance(node.get("data"), dict) and isinstance(node["data"].get("items"), list):
-                return nodes, node["data"]["items"]
+                return nodes, node["data"]["items"], node
     raise OutfitError("unsupported_outfit_collection")
+
+
+def page_path(reference, collection_path):
+    parsed = urlparse(reference)
+    if (parsed.scheme != "https" or parsed.netloc != "api.imvu.com" or
+            parsed.path != collection_path or parsed.fragment or parsed.params or len(reference) > 3000):
+        raise OutfitError("invalid_outfit_next_link")
+    return parsed.path + ("?" + parsed.query if parsed.query else "")
 
 
 async def outfit_card(api, reference, nodes, uid, target):
@@ -138,13 +146,21 @@ async def load_named_outfit(api, uid, name="Bot"):
     if not re.fullmatch(r"\d+", uid) or not isinstance(name, str) or not name.strip():
         raise OutfitError("invalid_outfit_selection")
     target = name.strip().casefold()
-    LOG.info("Wardrobe parser v11.3: looking up the configured saved outfit; following ref relations")
+    LOG.info("Wardrobe parser v11.4: following official collection next links and outfit ref relations")
     path = f"/user/user-{uid}/outfits"
     seen = set()
+    visited_pages = set()
     selected = None
-    for offset in range(0, 5000, 25):
-        payload = await api("GET", path, params={"start_index": offset, "limit": 25})
-        nodes, items = collection_node(payload, path)
+    page_url = API + path
+    # Official UiCore.RestCollection pages with relations.next; it does NOT
+    # infer another page from item count or calculate a start_index parameter.
+    for page_number in range(1, 201):
+        request_path = page_path(page_url, path)
+        if request_path in visited_pages:
+            raise OutfitError("outfit_pagination_cycle")
+        visited_pages.add(request_path)
+        payload = await api("GET", request_path)
+        nodes, items, collection = collection_node(payload, path)
         new_count = 0
         for item in items:
             reference = item.get("id") if isinstance(item, dict) else item
@@ -152,6 +168,8 @@ async def load_named_outfit(api, uid, name="Bot"):
             if reference in seen:
                 continue
             seen.add(reference)
+            if len(seen) > 5000:
+                raise OutfitError("outfit_search_limit_reached")
             new_count += 1
             node = await outfit_card(api, reference, nodes, uid, target)
             if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
@@ -171,10 +189,22 @@ async def load_named_outfit(api, uid, name="Bot"):
             if not isinstance(data.get("pids"), list):
                 schema_diagnostic(node, "detail_products_missing")
             selected = {"name": outfit_name.strip(), "id": reference, "products": product_ids(data.get("pids"))}
-        if len(items) < 25:
+        relations = collection.get("relations", {})
+        if not isinstance(relations, dict):
+            raise OutfitError("unsupported_outfit_collection")
+        next_url = relations.get("next")
+        if isinstance(next_url, dict):
+            next_url = next_url.get("id")
+        LOG.info("Wardrobe collection page=%s returned=%s new=%s next=%s matched=%s",
+                 page_number, len(items), new_count, bool(next_url), selected is not None)
+        if next_url is None or next_url == "":
             if selected is None:
                 raise OutfitError("named_outfit_not_found")
             return selected
+        if not isinstance(next_url, str):
+            raise OutfitError("invalid_outfit_next_link")
+        page_url = urljoin(page_url, next_url)
+        page_path(page_url, path)  # validate before any authenticated request
         if new_count == 0:
             raise OutfitError("outfit_pagination_not_advancing")
     raise OutfitError("outfit_search_limit_reached")
