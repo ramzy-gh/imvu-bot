@@ -1,4 +1,4 @@
-"""RAMSEI v7: password-only login with room-chat diagnostics."""
+"""RAMSEI v8: bilingual chat, AI diagnostics and saved avatar appearance."""
 import asyncio
 import base64
 import contextlib
@@ -10,6 +10,7 @@ import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 from aiohttp import web
@@ -48,6 +49,23 @@ def transport_user_id(value):
         return decoded if re.fullmatch(r"\d+", decoded) else None
     except (ValueError, UnicodeError):
         return None
+
+
+def appearance_products(data, uid):
+    node = data.get("denormalized", {}).get(API + f"/profile_outfit/profile_outfit-{uid}", {})
+    look = node.get("data", {}).get("look_url", "")
+    if not isinstance(look, str):
+        raise ValueError("Saved profile has no supported look URL")
+    parsed = urlparse(look)
+    if parsed.scheme != "https" or parsed.netloc != "api.imvu.com" or not parsed.path.startswith("/look/"):
+        raise ValueError("Saved profile has no supported look URL")
+    values = unquote(parsed.path[len("/look/"):]).split(",")
+    if not values or len(values) > 100 or any(not re.fullmatch(r"[1-9]\d*", v) for v in values):
+        raise ValueError("Saved profile has invalid product IDs")
+    products = list(dict.fromkeys(values))
+    if len(" ".join(products)) > 400:
+        raise ValueError("Saved outfit exceeds supported announcement length")
+    return products
 
 
 def participant_ids(data, collection_url):
@@ -279,6 +297,9 @@ class Bot:
             "messages_acked": 0, "last_rejection": "none"}
         self.last_diagnostic = 0
         self.last_membership_refresh = 0
+        self.appearance = {"state": "not_announced", "product_count": 0}
+        self.outfit_products = []
+        self.last_appearance = 0
         self.session = None
         self.op = 0
         self.last_said = 0
@@ -417,6 +438,8 @@ class Bot:
         if not greet:
             LOG.info("Membership loaded: %s participants recognized", len(new))
         if greet:
+            if new - self.members - {self.user_id} and self.chat_ready:
+                await self.announce_appearance()
             for uid in sorted(new - self.members - {self.user_id}):
                 now = time.monotonic()
                 if now - self.greeted.get(uid, -1000) < 300:
@@ -428,7 +451,7 @@ class Bot:
                 user = await self.api("GET", f"/user/user-{uid}")
                 info = user.get("denormalized", {}).get(API + f"/user/user-{uid}", {}).get("data", {})
                 name = info.get("display_name") or info.get("username") or "friend"
-                template = os.getenv("WELCOME_MESSAGE", "نورت الروم يا {name}! 😎💛 أنا رامسي البوت، للمزيكا !play واسم الأغنية، وللعب !game 🎲")
+                template = os.getenv("WELCOME_MESSAGE", "Welcome, {name}! نورت الروم 😎💛 Music: !play | Games: !game | Chat: Ramsei / رامسي")
                 await self.say(template.replace("{name}", str(name)[:60]))
         self.members = new
 
@@ -439,14 +462,34 @@ class Bot:
             await self.api("POST", f"/chat/chat-{self.room}/participants/user-{self.user_id}", json={})
             await self.participants(greet=True)
 
+    async def announce_appearance(self):
+        if time.monotonic() - self.last_appearance < 10:
+            return
+        try:
+            if not self.outfit_products:
+                profile = await self.api("GET", f"/profile_outfit/profile_outfit-{self.user_id}")
+                self.outfit_products = appearance_products(profile, self.user_id)
+            ids = " ".join(self.outfit_products)
+            # Announce only this account's actual saved outfit, under its own identity.
+            # No room/global settings, seats, or other avatars are modified.
+            await self.say("*putOnOutfit " + ids)
+            await self.say("*use " + ids)
+            self.last_appearance = time.monotonic()
+            self.appearance = {"state": "announced_not_render_verified", "product_count": len(self.outfit_products)}
+            LOG.info("Saved avatar appearance announced: %s products; client rendering requires visual verification", len(self.outfit_products))
+        except (RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as error:
+            self.appearance = {"state": "announcement_failed", "product_count": 0}
+            LOG.warning("Avatar appearance could not be announced: %s", type(error).__name__)
+
     async def confirm_chat_ready(self):
         if self.chat_ready:
             return
         self.chat_ready = True
         LOG.info("Room chat subscription confirmed; checking message delivery")
+        await self.announce_appearance()
         if not self.announced:
             self.announced = True
-            await self.say("رامسي معاكم يا نجوم! 😎💛 جربوا !help أو !game")
+            await self.say("Ramsei is here! رامسي معاكم يا نجوم 😎💛 Try !help / !game")
 
     async def receive(self):
         async for message in self.ws:
@@ -576,7 +619,7 @@ class Bot:
                     titles = [t["title"] for t in list(self.radio.queue._queue)[:5]]
                     await self.say("Next: " + " | ".join(titles) if titles else "The queue is empty.")
                 else:
-                    await self.say("🎶 !play اسم الأغنية | !queue | !np | 🎲 !game !guess !joke !dare !fortune !scores | ناديني رامسي للدردشة 😎")
+                    await self.say("🎶 !play <song / اسم الأغنية> | !queue !np !skip !stop | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
             except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError):
                 LOG.warning("A command failed; no credentials or media URLs logged.")
                 with contextlib.suppress(ConnectionError):
@@ -609,6 +652,7 @@ class Bot:
                             raise RuntimeError("IMQ authentication rejected or response changed.")
                         await self.packet("msg_c2g_open_floodgates")
                         self.chat_ready = False
+                        self.last_appearance = 0
                         self.pending_chat_ops.clear()
                         for queue in (self.queue, f"inv:/chat/chat-{self.room}"):
                             operation = await self.packet("msg_c2g_subscribe", queues_with_results=[{"record": "subscription", "name": queue, "op_id": self.op + 1}])
@@ -659,6 +703,7 @@ async def main():
             "message": bot.status_message,
             "chat_ready": bot.chat_ready and bot.connected,
             "participants_recognized": len(bot.members), "chat_diagnostics": bot.diagnostics,
+            "ai": bot.social.ai_status, "avatar": bot.appearance,
             "room": bot.room, "playing": radio.current["title"] if radio.current else None,
             "queued": radio.queue.qsize(), "listeners": len(radio.listeners)})
     app.router.add_get("/health", health)
