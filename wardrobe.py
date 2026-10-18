@@ -1,8 +1,48 @@
 """Read the authenticated account's named saved outfit, without profile fallback."""
 import re
+import logging
 from urllib.parse import urlparse
 
 API = "https://api.imvu.com"
+LOG = logging.getLogger("ramsei.wardrobe")
+
+
+def card_name(data):
+    if not isinstance(data, dict):
+        return None
+    return next((data[k] for k in ("outfit_name", "outfitName", "name")
+                 if isinstance(data.get(k), str)), None)
+
+
+def schema_diagnostic(node, stage):
+    """Field labels only: never log outfit names, product IDs, or raw payloads."""
+    def fields(value):
+        return ",".join(sorted(k for k in value if isinstance(k, str)
+                              and re.fullmatch(r"[A-Za-z_]{1,40}", k))[:25]) if isinstance(value, dict) else "not_object"
+    data = node.get("data") if isinstance(node, dict) else None
+    relations = node.get("relations") if isinstance(node, dict) else None
+    LOG.warning("Wardrobe schema: parser=v11.2 stage=%s node_fields=%s data_fields=%s relation_fields=%s",
+                stage, fields(node), fields(data), fields(relations))
+
+
+def resolved_node(payload, reference, uid):
+    nodes = payload.get("denormalized", {}) if isinstance(payload, dict) else {}
+    if not isinstance(nodes, dict):
+        return {}
+    if isinstance(nodes.get(reference), dict):
+        return nodes[reference]
+    # A collection edge may resolve to the canonical outfit node. This ID comes
+    # from the authenticated response, not an additional user-supplied request.
+    response_id = payload.get("id")
+    if isinstance(response_id, str):
+        try:
+            outfit_path(response_id, uid)
+        except OutfitError:
+            return {}
+        node = nodes.get(response_id)
+        if isinstance(node, dict):
+            return node
+    return {}
 
 
 class OutfitError(ValueError):
@@ -62,6 +102,7 @@ async def load_named_outfit(api, uid, name="Bot"):
     if not re.fullmatch(r"\d+", uid) or not isinstance(name, str) or not name.strip():
         raise OutfitError("invalid_outfit_selection")
     target = name.strip().casefold()
+    LOG.info("Wardrobe parser v11.2: looking up the configured saved outfit")
     path = f"/user/user-{uid}/outfits"
     seen = set()
     selected = None
@@ -76,23 +117,34 @@ async def load_named_outfit(api, uid, name="Bot"):
                 continue
             seen.add(reference)
             new_count += 1
-            node = nodes.get(reference)
-            if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
+            node = nodes.get(reference, {})
+            data = node.get("data") if isinstance(node, dict) else None
+            current_name = card_name(data)
+            # A collection can denormalize a partial record. A data block alone
+            # doesn't mean the full outfit card has been fetched.
+            need_detail = current_name is None or (current_name.strip().casefold() == target
+                           and (not isinstance(data.get("pids"), list) or not data["pids"]))
+            if need_detail:
                 detail = await api("GET", detail_path)
-                detail_nodes = detail.get("denormalized", {}) if isinstance(detail, dict) else {}
-                node = detail_nodes.get(reference, {}) if isinstance(detail_nodes, dict) else {}
+                node = resolved_node(detail, reference, uid)
             if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
+                schema_diagnostic(node, "detail_node_missing")
+                if need_detail:
+                    schema_diagnostic(detail, "detail_envelope")
                 raise OutfitError("unsupported_outfit_fields")
             data = node.get("data", {})
             # The TS wrapper exposes outfitName, but its serializer maps this
             # property to outfit_name on the wire. Read the raw API field first.
-            outfit_name = data.get("outfit_name", data.get("outfitName", data.get("name")))
+            outfit_name = card_name(data)
             if not isinstance(outfit_name, str):
+                schema_diagnostic(node, "detail_name_missing")
                 raise OutfitError("unsupported_outfit_fields")
             if outfit_name.strip().casefold() != target:
                 continue
             if selected is not None:
                 raise OutfitError("duplicate_outfit_name")
+            if not isinstance(data.get("pids"), list):
+                schema_diagnostic(node, "detail_products_missing")
             selected = {"name": outfit_name.strip(), "id": reference, "products": product_ids(data.get("pids"))}
         if len(items) < 25:
             if selected is None:
