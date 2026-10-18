@@ -1,4 +1,4 @@
-"""RAMSEI v9: Groq chat and refreshed account-saved outfit appearance."""
+"""RAMSEI v11: named wardrobe outfit Bot, AI fallback, and English welcomes."""
 import asyncio
 import base64
 import contextlib
@@ -19,6 +19,7 @@ from personality import ALIASES, Social
 from permissions import Permissions, MANAGEMENT_COMMANDS
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
+from wardrobe import load_named_outfit, OutfitError
 
 LOG = logging.getLogger("ramsei")
 API = "https://api.imvu.com"
@@ -301,6 +302,8 @@ class Bot:
         self.outfit_products = []
         self.last_appearance = 0
         self.outfit_loaded_at = 0
+        self.next_outfit_attempt = 0
+        self.outfit_name = os.getenv("IMVU_OUTFIT_NAME", "Bot").strip() or "Bot"
         self.session = None
         self.op = 0
         self.last_said = 0
@@ -451,9 +454,10 @@ class Bot:
                     self.greeted.popitem(last=False)
                 user = await self.api("GET", f"/user/user-{uid}")
                 info = user.get("denormalized", {}).get(API + f"/user/user-{uid}", {}).get("data", {})
-                name = info.get("display_name") or info.get("username") or "friend"
-                template = os.getenv("WELCOME_MESSAGE", "Welcome, {name}! نورت الروم 😎💛 Music: !play | Games: !game | Chat: Ramsei / رامسي")
-                await self.say(template.replace("{name}", str(name)[:60]))
+                name = info.get("username") or info.get("display_name") or "friend"
+                # Named English welcomes are fixed even if an old Arabic override exists.
+                safe_name = re.sub(r"[\x00-\x1f\x7f]", "", str(name))[:60] or "friend"
+                await self.say(f"Welcome, {safe_name}! Great to have you here! Music: !play | Games: !game")
         self.members = new
 
     async def presence(self):
@@ -464,25 +468,28 @@ class Bot:
             await self.participants(greet=True)
 
     async def announce_appearance(self):
-        if time.monotonic() - self.last_appearance < 10:
+        if time.monotonic() - self.last_appearance < 10 or time.monotonic() < self.next_outfit_attempt:
             return
         try:
             if not self.outfit_products or time.monotonic() - self.outfit_loaded_at > 300:
-                profile = await self.api("GET", f"/profile_outfit/profile_outfit-{self.user_id}")
-                self.outfit_products = appearance_products(profile, self.user_id)
+                selected = await load_named_outfit(self.api, self.user_id, self.outfit_name)
+                self.outfit_products = selected["products"]
                 self.outfit_loaded_at = time.monotonic()
             ids = " ".join(self.outfit_products)
-            # Announce only this account's actual saved outfit, under its own identity.
+            # Announce only the named outfit from this account's own wardrobe.
             # No room/global settings, seats, or other avatars are modified.
             await self.say("*putOnOutfit " + ids)
             await self.say("*use " + ids)
             self.last_appearance = time.monotonic()
             self.appearance = {"state": "announced_not_render_verified", "product_count": len(self.outfit_products),
-                               "source": "account_saved_profile_outfit"}
-            LOG.info("Latest account-saved profile outfit announced: %s products; client rendering requires visual verification", len(self.outfit_products))
+                                 "source": "named_saved_outfit", "name": self.outfit_name}
+            LOG.info("Named saved outfit selected and announced: %s products; client rendering requires visual verification", len(self.outfit_products))
         except (RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as error:
-            self.appearance = {"state": "announcement_failed", "product_count": 0}
-            LOG.warning("Avatar appearance could not be announced: %s", type(error).__name__)
+            self.next_outfit_attempt = time.monotonic() + 60
+            reason = str(error) if isinstance(error, OutfitError) else type(error).__name__
+            self.appearance = {"state": "announcement_failed", "product_count": 0,
+                               "source": "named_saved_outfit", "name": self.outfit_name, "reason": reason}
+            LOG.warning("Named outfit not announced: reason=%s; no profile/default substitution", reason)
 
     async def confirm_chat_ready(self):
         if self.chat_ready:
