@@ -7,6 +7,7 @@ import time
 import logging
 from collections import OrderedDict
 import aiohttp
+from offline_chat import OfflineChat
 
 LOG = logging.getLogger("ramsei.ai")
 
@@ -91,6 +92,7 @@ class Social:
         self.last_ai = 0
         self.ai_calls = []
         self.ai_retry_after = 0
+        self.offline = OfflineChat()
         self.languages = OrderedDict()
         self.ai_status = {"state": "not_tested", "http_status": None, "reason": "none"}
 
@@ -102,7 +104,7 @@ class Social:
             self.languages.popitem(last=False)
         return language
 
-    def api_error(self, status, result, language):
+    def api_error(self, status, result, language, uid=None, text=""):
         error = result.get("error", {}) if isinstance(result, dict) else {}
         if not isinstance(error, dict):
             error = {}
@@ -144,6 +146,8 @@ class Social:
         self.ai_status["provider"] = provider
         self.ai_retry_after = time.monotonic() + (60 if status == 429 else 120)
         LOG.warning("%s request failed: HTTP %s status=%s reason=%s", provider, status, category, reason)
+        if uid is not None:
+            return self.offline_reply(uid, text, language)
         # Never log provider error.message, which could contain request/credential details.
         en = {401: "My AI key needs checking 🔑 Games and music still work!",
               403: "My AI access was denied 🔒 The host needs to check the key and region.",
@@ -191,33 +195,46 @@ class Social:
         await self.say(f"صح يا نجم! 🥳🏆 بقى معاك {self.scores[uid]} نقطة! نلعب تاني؟ !game" if language == "ar" else f"Correct! 🥳🏆 You have {self.scores[uid]} points! Another round? !game")
         return True
 
+    def offline_reply(self, uid, text, language):
+        answer = self.offline.reply(uid, text, language)
+        self.ai_status.update(fallback="scripted", fallback_topic=self.offline.last_match)
+        return answer
+
     async def ai(self, uid, text):
+        try:
+            answer = await self._ai(uid, text)
+            return answer
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError, RuntimeError,
+                OSError, asyncio.TimeoutError, aiohttp.ClientError) as error:
+            self.ai_status = {"state": "error", "http_status": None, "reason": type(error).__name__}
+            self.ai_retry_after = time.monotonic() + 60
+            LOG.warning("AI unavailable; using scripted fallback: %s", type(error).__name__)
+            return self.offline_reply(uid, text, self.language(uid, text))
+
+    async def _ai(self, uid, text):
         language = self.language(uid, text)
         provider = os.getenv("AI_PROVIDER", "groq").strip().lower()
         if provider not in {"groq", "gemini"}:
-            return "My AI_PROVIDER setting needs to be groq or gemini."
+            self.ai_status = {"state": "error", "reason": "invalid_provider_setting", "http_status": None}
+            return self.offline_reply(uid, text, language)
         key = os.getenv("GROQ_API_KEY" if provider == "groq" else "GEMINI_API_KEY", "").strip()
         if not key:
             self.ai_status = {"state": "not_configured", "http_status": None, "reason": "missing_key"}
-            if language == "en":
-                return "Hey! 😎 I'm in basic mode until my AI key is configured. Want a game or some music? !game / !play 🎶"
-            return random.choice([
-                "يا نجم أنا معاك 😎💛 لسه مستني مفتاح الـ AI عشان أرغي معاك بحرية! لحد ما يتظبط جرّب !game أو !joke 🎲",
-                "سامعك يا معلم 😂🎧 أنا بوت رامسي! نلعب ولا نشغل أغنية؟ !game أو !play ومعاها اسم الأغنية 🎶",
-            ])
+            return self.offline_reply(uid, text, language)
         now = time.monotonic()
         if now < self.ai_retry_after:
-            return "الـ AI واخد بريك صغير 😅 نلعب !game أو نطلب أغنية بـ !play؟" if language == "ar" else "AI's taking a short break 😅 Fancy !game or a song with !play?"
+            return self.offline_reply(uid, text, language)
         self.ai_calls = [t for t in self.ai_calls if now - t < 3600]
         if len(self.ai_calls) >= int(os.getenv("AI_MAX_CALLS_PER_HOUR", "60")):
-            return "وصلت لحد الرغي بالـ AI للساعة دي 😂☕ الألعاب والمزيكا شغالين!" if language == "ar" else "I've hit my hourly AI chat limit 😂☕ Games and music still work!"
+            self.ai_status = {"state": "quota", "http_status": None, "reason": "local_hourly_limit"}
+            return self.offline_reply(uid, text, language)
         await asyncio.sleep(max(0, self.last_ai + 6 - now))
         self.last_ai = time.monotonic()
         self.ai_calls.append(self.last_ai)
         model = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b") if provider == "groq" else os.getenv("GEMINI_MODEL", "gemini-flash-latest")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9/._-]{0,100}", model):
             self.ai_status = {"state": "error", "http_status": None, "reason": "invalid_model_setting"}
-            return "اسم موديل الـ AI محتاج يتظبط في الإعدادات 🔧" if language == "ar" else "My AI model setting needs fixing 🔧"
+            return self.offline_reply(uid, text, language)
         previous = self.history.get(uid, [])[-6:]
         contents = previous + [{"role": "user", "parts": [{"text": text[:600]}]}]
         instructions = (
@@ -245,14 +262,14 @@ class Social:
                         failure = await response.json()
                     except (ValueError, aiohttp.ContentTypeError):
                         failure = {}
-                    return self.api_error(response.status, failure, language)
+                    return self.api_error(response.status, failure, language, uid, text)
                 result = await response.json()
         self.ai_status = {"state": "ok", "http_status": 200, "reason": "none"}
         parts = (result.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
         answer = " ".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
         if not answer:
             self.ai_status["state"] = "empty_response"
-            return "قولها بطريقة تانية يا نجم 😄💛" if language == "ar" else "Could you phrase that another way? 😄💛"
+            return self.offline_reply(uid, text, language)
         answer = answer[:300]
         self.history[uid] = (contents + [{"role": "model", "parts": [{"text": answer}]}])[-6:]
         self.history.move_to_end(uid)
@@ -261,10 +278,13 @@ class Social:
         return answer
 
     async def groq_reply(self, uid, contents, instructions, model, key, language):
+        instructions += (" Reply directly with ordinary conversational text only. No tools or functions are available. "
+                         "Do not call, simulate, or output tool/function calls. If you cannot answer, say so briefly.")
         messages = [{"role": "system", "content": instructions}]
         messages += [{"role": "assistant" if c["role"] == "model" else "user",
                       "content": " ".join(p.get("text", "") for p in c["parts"])} for c in contents]
-        payload = {"model": model, "messages": messages, "max_completion_tokens": 1024}
+        payload = {"model": model, "messages": messages, "max_completion_tokens": 1024,
+                   "tool_choice": "none", "temperature": 0.6}
         if model.startswith("openai/gpt-oss-"):
             payload.update(reasoning_effort="low", include_reasoning=False)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
@@ -275,7 +295,7 @@ class Social:
                 except (ValueError, aiohttp.ContentTypeError):
                     result = {}
                 if response.status != 200:
-                    return self.api_error(response.status, result, language)
+                    return self.api_error(response.status, result, language, uid, contents[-1]["parts"][0]["text"])
         choices = result.get("choices") or [{}]
         answer = choices[0].get("message", {}).get("content") or ""
         # Never put a model's reasoning field or think blocks into room chat.
@@ -283,7 +303,7 @@ class Social:
         self.ai_status = {"state": "ok" if answer else "empty_response", "http_status": 200,
                           "reason": "none", "provider": "groq"}
         if not answer:
-            return "قولها بطريقة تانية كده 😄" if language == "ar" else "Try asking that another way 😄"
+            return self.offline_reply(uid, contents[-1]["parts"][0]["text"], language)
         self.history[uid] = (contents + [{"role": "model", "parts": [{"text": answer}]}])[-6:]
         self.history.move_to_end(uid)
         while len(self.history) > 30:
