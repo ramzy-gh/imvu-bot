@@ -104,6 +104,8 @@ class Social:
 
     def api_error(self, status, result, language):
         error = result.get("error", {}) if isinstance(result, dict) else {}
+        if not isinstance(error, dict):
+            error = {}
         category = error.get("status", "UNKNOWN")
         if not isinstance(category, str) or not re.fullmatch(r"[A-Z_]{1,50}", category):
             category = "UNKNOWN"
@@ -112,6 +114,33 @@ class Social:
         reason = next((r for r in reasons if isinstance(r, str) and re.fullmatch(r"[A-Z_]{1,60}", r)), category)
         self.ai_status = {"state": "error", "http_status": status, "reason": reason}
         provider = os.getenv("AI_PROVIDER", "groq").lower()
+        if provider == "groq":
+            # Groq uses lowercase type/code rather than Gemini's status/details.
+            def safe_enum(value):
+                return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", value) else "unknown"
+            category = safe_enum(error.get("type"))
+            reason = safe_enum(error.get("code"))
+            message = error.get("message", "")
+            message = message.lower() if isinstance(message, str) else ""
+            hints = []
+            # Emit only fixed labels; never provider text, prompts, or credentials.
+            for phrase, label in {
+                "not supported": "unsupported_setting", "unsupported": "unsupported_setting",
+                "not allowed": "not_allowed", "permission": "permission_required",
+                "terms": "terms_required", "decommissioned": "model_retired",
+                "does not exist": "model_not_found", "access to": "access_required",
+                "organization": "organization_setting", "verify": "verification_required",
+                "token": "token_setting", "failed to generate": "generation_failed",
+            }.items():
+                if phrase in message:
+                    hints.append(label)
+            fields = [field for field in ("include_reasoning", "reasoning_effort", "max_completion_tokens",
+                       "messages", "model", "system", "temperature") if field in message]
+            model = safe_enum(os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").replace("/", ":").replace(":", "."))
+            LOG.warning("Groq rejection details: type=%s code=%s param=%s model=%s hints=%s fields=%s",
+                        category, reason, safe_enum(error.get("param")), model,
+                        ",".join(sorted(set(hints))) or "unclassified", ",".join(fields) or "none")
+            self.ai_status.update(reason=reason, error_type=category, hints=sorted(set(hints)), fields=fields)
         self.ai_status["provider"] = provider
         self.ai_retry_after = time.monotonic() + (60 if status == 429 else 120)
         LOG.warning("%s request failed: HTTP %s status=%s reason=%s", provider, status, category, reason)
