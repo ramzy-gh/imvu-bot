@@ -1,4 +1,4 @@
-"""Experimental, independently implemented IMVU room bot; live validation required."""
+"""RAMSEI v6: password-only IMVU login; live validation required."""
 import asyncio
 import base64
 import contextlib
@@ -26,6 +26,12 @@ IMQ = "wss://wss-imq.imvu.com/streaming/imvu_pre"
 
 class AuthenticationRequired(RuntimeError):
     pass
+
+
+class LoginPaused(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
 
 
 def encode(value):
@@ -184,7 +190,7 @@ class Radio:
                     except asyncio.TimeoutError:
                         self.proc.kill()
                         await self.proc.wait()
-                if self.proc and self.proc.returncode and not self.skip.is_set():
+                if self.proc and self.proc.returncode and not self.skip.is_set() and not asyncio.current_task().cancelling():
                     LOG.warning("Audio encoder stopped (code %s)", self.proc.returncode)
                     await asyncio.sleep(2)
                 self.proc = None
@@ -205,6 +211,9 @@ class Bot:
         self.commands = asyncio.Queue(maxsize=50)
         self.ws = None
         self.connected = False
+        self.status = "starting"
+        self.status_message = ""
+        self.authenticated = asyncio.Event()
         self.session = None
         self.op = 0
         self.last_said = 0
@@ -214,7 +223,7 @@ class Bot:
     async def api(self, method, path, **kwargs):
         async with self.session.request(method, API + path, **kwargs) as response:
             if response.status == 401:
-                raise AuthenticationRequired("IMVU session expired; a fresh login may require 2FA.")
+                raise AuthenticationRequired("IMVU session expired; a fresh password login is required.")
             if response.status not in (200, 201, 204):
                 raise RuntimeError(f"IMVU request failed: HTTP {response.status} at {path.split('?')[0]}")
             return await response.json() if response.status != 204 else {}
@@ -251,7 +260,7 @@ class Bot:
                  "sauce": sauce, "cookies": {k: v.value for k, v in self.session.cookie_jar.filter_cookies(URL(API)).items()}}
         try:
             StateStore("session:" + saved["username"].lower(), self.session_path()).save(saved)
-            LOG.info("Session saved; remove IMVU_2FA_CODE after successful connection")
+            LOG.info("Authenticated session saved")
         except OSError:
             if os.getenv("DATABASE_URL", "").strip():
                 raise RuntimeError("Could not save the session to the external database.") from None
@@ -265,13 +274,15 @@ class Bot:
         if not password:
             raise RuntimeError("Set IMVU_PASSWORD privately in Bothost environment variables.")
         payload = {"username": username, "password": password, "gdpr_cookie_acceptance": False}
-        if os.getenv("IMVU_2FA_CODE"):
-            payload.update({"2fa_code": os.environ["IMVU_2FA_CODE"], "remember_device": True})
         async with self.session.post(API + "/login", json=payload) as response:
             if response.status == 202:
-                raise RuntimeError("IMVU requires verification. Enter the current code as IMVU_2FA_CODE and restart.")
+                raise LoginPaused("verification_required", "IMVU requires additional verification. V6 supports password-only login and cannot complete this challenge. Login is paused; no automatic retries. Resolve account verification through IMVU before restarting.")
+            if response.status == 429:
+                retry_after = response.headers.get("Retry-After", "")
+                wait = f" Server requests a wait of {retry_after} seconds." if retry_after.isdigit() else ""
+                raise LoginPaused("rate_limited", "IMVU rate-limited login (HTTP 429). Login is paused; no automatic retries." + wait)
             if response.status not in (200, 201):
-                raise RuntimeError(f"Login rejected: HTTP {response.status}. Check credentials/verification in IMVU.")
+                raise LoginPaused("login_rejected", f"Login rejected: HTTP {response.status}. Check credentials/verification privately. Login is paused; restart only after resolving it.")
             data = await response.json()
         nodes = data.get("denormalized", {}).values()
         auth = next((node.get("data", {}) for node in nodes if node.get("data", {}).get("sauce")), {})
@@ -287,6 +298,22 @@ class Bot:
             raise RuntimeError("IMVU did not issue the expected session cookie.")
         self.session.headers.update({"X-Imvu-Sauce": auth["sauce"], "X-Imvu-Application": "next_desktop/1"})
         await asyncio.to_thread(self.persist_session, auth["sauce"])
+
+    async def login_or_pause(self, force=False):
+        """Keep the web process alive on auth failure so hosting cannot restart-loop login."""
+        try:
+            await self.login(force=force)
+        except (LoginPaused, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as error:
+            self.connected = False
+            self.authenticated.clear()
+            self.status = error.status if isinstance(error, LoginPaused) else "login_paused"
+            self.status_message = str(error) if isinstance(error, RuntimeError) else "Login could not complete. Check configuration/network, then restart once."
+            LOG.warning("%s", self.status_message)
+            await asyncio.Event().wait()  # Only an explicit process restart attempts login again.
+            return
+        self.status = "room_connecting"
+        self.status_message = ""
+        self.authenticated.set()
 
     async def packet(self, record, **fields):
         if self.ws is None or self.ws.closed:
@@ -442,7 +469,7 @@ class Bot:
         timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout, headers={"X-Imvu-Application": "welcome/1",
                 "Origin": "https://www.imvu.com", "Accept": "application/json"}) as self.session:
-            await self.login()
+            await self.login_or_pause()
             delay = 5
             while True:
                 try:
@@ -479,8 +506,8 @@ class Bot:
                             await asyncio.gather(*tasks, return_exceptions=True)
                 except AuthenticationRequired:
                     self.connected = False
-                    LOG.warning("Saved login expired; trying normal IMVU login with configured verification")
-                    await self.login(force=True)
+                    LOG.warning("Saved login expired; trying password-only IMVU login")
+                    await self.login_or_pause(force=True)
                 except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, ValueError) as error:
                     detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
                     LOG.warning("Room connection lost (%s); retrying in %s seconds", detail, delay)
@@ -503,7 +530,8 @@ async def main():
     bot = Bot(radio)
     app = web.Application()
     async def health(request):
-        return web.json_response({"status": "connected" if bot.connected else "not_connected",
+        return web.json_response({"status": "connected" if bot.connected else bot.status,
+            "message": bot.status_message,
             "room": bot.room, "playing": radio.current["title"] if radio.current else None,
             "queued": radio.queue.qsize(), "listeners": len(radio.listeners)})
     app.router.add_get("/health", health)
@@ -514,8 +542,11 @@ async def main():
     if not os.getenv("DATABASE_URL", "").strip():
         LOG.warning("Local state only: Bothost rebuilds erase saved login, admins and blocks. Set DATABASE_URL for durable storage.")
     LOG.info("Radio endpoint /stream.mp3; diagnostic status /health")
+    async def start_radio_after_login():
+        await bot.authenticated.wait()
+        await radio.run(bot.say)
     tasks = [asyncio.create_task(bot.run()), asyncio.create_task(bot.command_worker()),
-             asyncio.create_task(radio.run(bot.say)), asyncio.create_task(bot.social.run())]
+             asyncio.create_task(start_radio_after_login()), asyncio.create_task(bot.social.run())]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
