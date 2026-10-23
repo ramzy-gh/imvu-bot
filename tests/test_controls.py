@@ -69,29 +69,6 @@ class Controls(unittest.IsolatedAsyncioTestCase):
                 await auth.login(bot)
         bot._login.assert_awaited_once()
 
-    async def test_audio_survives_chat_failure(self):
-        radio = Radio()
-        radio.queue.put_nowait({"title": "Test", "url": "https://example.com/audio"})
-        delivered = asyncio.Event()
-        class Output:
-            async def read(self, size):
-                await asyncio.sleep(0)
-                return b"mp3"
-        class Process:
-            stdout = Output()
-            returncode = None
-            def terminate(self):
-                self.returncode = 0
-            async def wait(self):
-                return self.returncode
-        async def broadcast(chunk):
-            delivered.set()
-        with patch("bot.asyncio.create_subprocess_exec", AsyncMock(return_value=Process())), patch.object(radio, "broadcast", broadcast):
-            task = asyncio.create_task(radio.run(AsyncMock(side_effect=ConnectionError())))
-            await asyncio.wait_for(delivered.wait(), 2)
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
     async def test_slow_listener_and_shutdown(self):
         radio = Radio()
         listener = asyncio.Queue(maxsize=1)

@@ -163,6 +163,9 @@ class Radio:
         self.accepting = False
         self.last_error = None
         self.bytes_sent = 0
+        self.pcm = asyncio.Queue(maxsize=5)
+        self.encoder_starts = 0
+        self.track_starts = 0
 
     async def lookup(self, query):
         # Only YouTube search terms / YouTube URLs; no arbitrary remote URL input.
@@ -193,6 +196,8 @@ class Radio:
 
     def interrupt(self):
         self.skip.set()
+        while not self.pcm.empty():
+            self.pcm.get_nowait()
 
     async def broadcast(self, chunk):
         if chunk is not None:
@@ -227,67 +232,122 @@ class Radio:
             self.listeners.discard(listener)
         return response
 
-    async def run(self, announce):
-        while True:
-            track = None
+    def decoder_args(self, track):
+        return [os.getenv("FFMPEG_BINARY", "ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
+                "-protocol_whitelist", "https,tls,tcp,crypto", "-rw_timeout", "15000000",
+                "-i", track["url"], "-t", "900", "-vn", "-ac", "2", "-ar", "44100",
+                "-f", "s16le", "pipe:1"]
+
+    @staticmethod
+    async def stop_process(proc):
+        if proc:
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.terminate()
             try:
-                track = self.queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
+                await asyncio.wait_for(proc.communicate(), 3)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.communicate()
+
+    async def produce_pcm(self, announce):
+        """Decode each song; the encoder continues receiving silence during gaps."""
+        while True:
+            self.idle = True
+            self.current = None
+            track = await self.queue.get()
             self.current = track
-            self.idle = track is None
+            self.idle = False
             self.skip.clear()
-            args = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-re"]
-            if track:
-                args += ["-protocol_whitelist", "https,tls,tcp,crypto", "-rw_timeout", "15000000",
-                         "-i", track["url"], "-t", "900"]
-            else:
-                args += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
-            args += ["-vn", "-ac", "2", "-ar", "44100", "-c:a", "libmp3lame",
-                     "-b:a", "128k", "-write_xing", "0", "-id3v2_version", "0", "-f", "mp3", "pipe:1"]
             read_task = stop_task = None
             try:
-                self.proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
+                self.proc = await asyncio.create_subprocess_exec(*self.decoder_args(track), stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL)
-                if track:
-                    # Chat transport failure must not interrupt the audio stream.
-                    with contextlib.suppress(ConnectionError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
-                        await announce("Now playing: " + track["title"])
-                async def pump():
-                    while chunk := await self.proc.stdout.read(4096):
-                        await self.broadcast(chunk)
-                read_task = asyncio.create_task(pump())
+                self.track_starts += 1
                 stop_task = asyncio.create_task(self.skip.wait())
-                await asyncio.wait({read_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
-                if read_task.done():
-                    read_task.result()
-                    await self.proc.wait()
-                    if self.proc.returncode:
-                        self.last_error = "Audio source/encoder failed; try another song and rebuild yt-dlp."
-                    else:
-                        self.last_error = None
-            except OSError:
-                self.last_error = "FFmpeg could not start. Install FFmpeg or use the supplied Dockerfile."
-                LOG.error(self.last_error)
-                await asyncio.sleep(5)
+                with contextlib.suppress(ConnectionError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
+                    await announce("Now playing: " + track["title"])
+                while not self.skip.is_set():
+                    read_task = asyncio.create_task(self.proc.stdout.readexactly(17640))
+                    await asyncio.wait({read_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                    if self.skip.is_set():
+                        break
+                    ended = False
+                    try:
+                        chunk = read_task.result()
+                    except asyncio.IncompleteReadError as error:
+                        chunk, ended = error.partial, True
+                    if chunk:
+                        await self.pcm.put(chunk.ljust(17640, b"\0"))
+                    if ended:
+                        await self.proc.wait()
+                        self.last_error = "Audio source failed; try another song or update yt-dlp." if self.proc.returncode else None
+                        break
+            except (OSError, ValueError):
+                self.last_error = "Audio decoder could not start; check FFmpeg and the song source."
+                LOG.warning(self.last_error)
             finally:
                 for task in (read_task, stop_task):
                     if task:
                         task.cancel()
                 await asyncio.gather(*(t for t in (read_task, stop_task) if t), return_exceptions=True)
-                if self.proc and self.proc.returncode is None:
-                    self.proc.terminate()
-                    try:
-                        await asyncio.wait_for(self.proc.wait(), 5)
-                    except asyncio.TimeoutError:
-                        self.proc.kill()
-                        await self.proc.wait()
-                if self.proc and self.proc.returncode and not self.skip.is_set() and not asyncio.current_task().cancelling():
-                    LOG.warning("Audio encoder stopped (code %s)", self.proc.returncode)
-                    await asyncio.sleep(2)
+                await self.stop_process(self.proc)
                 self.proc = None
-                if track:
-                    self.queue.task_done()
+                self.current = None
+                self.idle = True
+                self.queue.task_done()
+
+    async def run(self, announce):
+        """One continuous MP3 encoder per room, across all tracks and idle silence."""
+        while True:
+            encoder = None
+            tasks = []
+            try:
+                encoder = await asyncio.create_subprocess_exec(os.getenv("FFMPEG_BINARY", "ffmpeg"),
+                    "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "s16le",
+                    "-ar", "44100", "-ac", "2", "-probesize", "32", "-analyzeduration", "0", "-i", "pipe:0", "-vn", "-c:a", "libmp3lame",
+                    "-b:a", "128k", "-reservoir", "0", "-write_xing", "0", "-id3v2_version", "0",
+                    "-flush_packets", "1", "-f", "mp3", "pipe:1",
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL)
+                self.encoder_starts += 1
+
+                async def feed():
+                    deadline = asyncio.get_running_loop().time()
+                    while True:
+                        try:
+                            chunk = self.pcm.get_nowait()
+                        except asyncio.QueueEmpty:
+                            chunk = bytes(17640)  # 100 ms of 44.1 kHz stereo s16 PCM
+                        encoder.stdin.write(chunk)
+                        await encoder.stdin.drain()
+                        deadline += 0.1
+                        now = asyncio.get_running_loop().time()
+                        if deadline < now:
+                            deadline = now
+                        await asyncio.sleep(max(0, deadline - now))
+
+                async def pump():
+                    while chunk := await encoder.stdout.read(4096):
+                        await self.broadcast(chunk)
+                    raise RuntimeError("Continuous audio encoder stopped")
+
+                tasks = [asyncio.create_task(coro) for coro in (feed(), pump(), self.produce_pcm(announce))]
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+            except (OSError, RuntimeError, ConnectionError):
+                self.last_error = "Continuous audio encoder failed; check FFmpeg installation. Retrying."
+                LOG.warning(self.last_error)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.stop_process(encoder)
+                while not self.pcm.empty():
+                    self.pcm.get_nowait()
+            await asyncio.sleep(2)
 
 
 class Bot:
@@ -316,6 +376,8 @@ class Bot:
             "messages_acked": 0, "last_rejection": "none"}
         self.last_diagnostic = 0
         self.last_membership_refresh = 0
+        self.last_account_presence = 0
+        self.account_presence = {"state": "not_updated", "online": None}
         self.appearance = {"state": "not_announced", "product_count": 0}
         self.outfit_products = []
         self.last_appearance = 0
@@ -337,7 +399,7 @@ class Bot:
             return await response.json() if response.status != 204 else {}
 
     def session_path(self):
-        return Path(os.getenv("SESSION_PATH", "/app/data/imvu-session.json"))
+        return Path(os.getenv("SESSION_PATH", "/app/data/ramsei/imvu-session.json"))
 
     def restore_session(self):
         try:
@@ -484,10 +546,24 @@ class Bot:
                 await self.say(f"Welcome, {safe_name}! Great to have you here! Music: !play | Games: !game")
         self.members = new
 
+    async def update_account_presence(self):
+        try:
+            data = await self.api("POST", f"/presence/presence-{self.user_id}", json={"online": True})
+            online = data.get("denormalized", {}).get(API + f"/presence/presence-{self.user_id}", {}).get("data", {}).get("online")
+            self.account_presence = {"state": "updated", "online": online if isinstance(online, bool) else None}
+            self.last_account_presence = time.monotonic()
+        except AuthenticationRequired:
+            raise
+        except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            self.account_presence = {"state": "update_failed", "online": None}
+            LOG.warning("Account presence update failed; will retry on the next heartbeat")
+
     async def presence(self):
         while True:
             await asyncio.sleep(15)
             await self.packet("msg_c2g_ping")
+            if time.monotonic() - self.last_account_presence >= 45:
+                await self.update_account_presence()
             await self.api("POST", f"/chat/chat-{self.room}/participants/user-{self.user_id}", json={})
             await self.participants(greet=True)
 
@@ -680,6 +756,7 @@ class Bot:
             delay = 5
             while True:
                 try:
+                    await self.update_account_presence()
                     await self.api("POST", f"/chat/chat-{self.room}/participants", json={})
                     data = await self.api("GET", f"/chat/chat-{self.room}")
                     info = data.get("denormalized", {}).get(API + f"/chat/chat-{self.room}", {}).get("data", {})
@@ -750,7 +827,7 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "3000"))).start()
     if not os.getenv("DATABASE_URL", "").strip():
-        LOG.warning("Local state only: Bothost rebuilds erase saved login, admins and blocks. Set DATABASE_URL for durable storage.")
+        LOG.info("File state enabled; keep permissions and login paths on persistent storage (/app/data/ramsei).")
     LOG.info("Radio endpoint /stream.mp3; diagnostic status /health")
     configured = os.getenv("IMVU_ROOM_IDS", "").strip()
     rooms = [r.strip() for r in configured.split(",") if r.strip()] if configured else [manager.default_room]

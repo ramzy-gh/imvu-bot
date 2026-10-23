@@ -13,7 +13,7 @@ OWNER_NAME = "Ramzy"
 class Permissions:
     def __init__(self):
         self.lock = threading.RLock()
-        self.path = Path(os.getenv("PERMISSIONS_PATH", "/app/data/permissions.json"))
+        self.path = Path(os.getenv("PERMISSIONS_PATH", "/app/data/ramsei/permissions.json"))
         self.admins = set()
         self.blocked = set()
         self.names = {OWNER_ID: OWNER_NAME}
@@ -40,6 +40,11 @@ class Permissions:
         self.admins.discard(OWNER_ID)
         self.blocked.difference_update(self.admins | {OWNER_ID})
         self.names[OWNER_ID] = OWNER_NAME
+        if data is None:
+            try:
+                self.save()
+            except OSError:
+                raise RuntimeError("Cannot write permissions storage; use a writable persistent PERMISSIONS_PATH.") from None
 
     @staticmethod
     def ids(values):

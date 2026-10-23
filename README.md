@@ -50,9 +50,11 @@ Example messages:
 6. Choose **Telegram** as the platform category. Bothost support confirmed that
    any category works with a custom Dockerfile. For the required Bot Token field,
    use the non-secret placeholder **imvu-custom**. Our code does not use it.
-   Bothost also confirmed that `/app/data` has **no persistent volume**: rebuilding
-   erases local files. For durable login, admins and blocks, configure an external
-   PostgreSQL `DATABASE_URL` as described below.
+   Use the persistent `/app/data` folder provided by this Bothost deployment.
+   Keep permission/login files under `/app/data/ramsei`, not `/tmp`. The startup
+   entrypoint fixes ownership of that private folder after the host mounts it,
+   then runs the bot without root privileges. On hosts without persistent storage,
+   configure an external PostgreSQL `DATABASE_URL` instead.
 7. Deploy. Check `/health` on the assigned domain. It must say `connected` before
    trying room commands. This means transport authentication succeeded; still
    verify actual messages in IMVU.
@@ -65,8 +67,8 @@ Example messages:
 | `PORT` | `3000` |
 | `DATABASE_URL` | Optional private external PostgreSQL connection string |
 | `STATE_NAMESPACE` | `ramsei-330286535-177` (keep unchanged across deployments) |
-| `SESSION_PATH` | `/app/data/imvu-session.json` |
-| `PERMISSIONS_PATH` | `/app/data/permissions.json` |
+| `SESSION_PATH` | `/app/data/ramsei/imvu-session.json` |
+| `PERMISSIONS_PATH` | `/app/data/ramsei/permissions.json` |
 | `ADMIN_IDS` | Leave empty; optional first-start admin seed only |
 | `GEMINI_API_KEY` | Optional: your private Google AI Studio API key |
 | `GEMINI_MODEL` | `gemini-flash-latest`, or an available text model for your key |
@@ -86,7 +88,7 @@ does not create a key or enable billing for you.
 4. On successful login, the bot saves the session to the configured database,
    or to `SESSION_PATH` if no database is configured. Remove `IMVU_2FA_CODE` once
    connected. Reuse is possible only while that saved session remains available
-   and valid. Without a database, rebuilding requires another normal login.
+   and valid. Keep the file on persistent storage to reuse it across rebuilds.
 5. If IMVU expires/revokes the session or requests another security challenge,
    repeat the normal verification flow. There is no 2FA bypass.
 
@@ -102,8 +104,9 @@ the connector needs adjustment rather than disabling account protections.
 
 Enter a PostgreSQL connection URL from a database you control as the private
 Bothost variable `DATABASE_URL`. This project does not create or pay for a database.
-Leave it unset for an initial deployment without durable state; then expect
-admins, blocks and the saved login to be lost on rebuilds.
+Leave it unset when using a verified persistent `/app/data/ramsei` volume.
+Without either persistent files or a database, admins, blocks and saved login
+will be lost on container replacement.
 
 When configured, the app creates `ramsei_state` and stores the login session and
 permission lists there. The database user needs permission to create that table
@@ -127,8 +130,12 @@ Set `PUBLIC_BASE_URL=https://YOUR-BOTHOST-DOMAIN` in the host variables. Type
 `!radio` in the room for that room's stream URL and listener count. A queued song
 does not automatically enable IMVU Radio. A room host/moderator must load the
 stream and press Play; check the radio volume on each client. Classic requires MP3.
-The bot now keeps audio running if a chat announcement fails, removes repeated
-MP3 metadata at song boundaries, and reports encoder failures in `/health`.
+The bot keeps one MP3 encoder alive across songs, skips and idle silence. Individual
+songs decode to PCM and feed that encoder; song changes do not reset the MP3
+stream. `/health` reports `encoder_starts`, `track_starts` and encoder errors.
+The bot cannot press Pause/Play inside other people's IMVU clients. Keeping the
+stream continuous addresses decoder resets at song boundaries; live client
+playback still needs verification.
 `audio_bytes` increasing confirms encoder output, not audible client playback.
 `listeners=0` means no client is connected to this server's stream.
 The actual cause on your deployed host still needs a live check.
@@ -211,14 +218,22 @@ author. If IMQ does not supply the expected identity field, management stays loc
 pending live diagnosis. Normal commands remain available.
 
 Admin and block changes go to PostgreSQL when `DATABASE_URL` is configured;
-otherwise they are saved atomically to the temporary `PERMISSIONS_PATH` file.
-They survive rebuilds only with external durable storage. Failed saves leave permissions unchanged.
+otherwise they are saved atomically to `PERMISSIONS_PATH`. Use
+`/app/data/ramsei/permissions.json` on this host's persistent data volume.
+The bot flushes saved state to disk before replacing the file. Failed saves leave
+permissions unchanged. Accounts lost during earlier `/tmp` deployments cannot be
+recovered unless a backup exists; add those admins/blocks again once.
 Do not delete the permissions file to update code. Remove the previous
 `ADMIN_IDS=330286535` variable or set it empty if you do not want that account to
 be an initial admin. Once a permissions file exists, it is authoritative; use
 the owner's chat commands to change admins.
 
 ## Multiple rooms and host terminal controls
+
+The bot refreshes its own account presence at room connection and about every
+45 seconds, separately from chat membership keepalives. `/health` includes
+`account_presence`. This keeps the online indicator updated while the bot can
+reach IMVU; outages, shutdowns and IMVU account restrictions can still make it offline.
 
 Set `IMVU_ROOM_IDS=330286535-177,OTHEROWNER-OTHERROOM` using real numeric room IDs
 to request multiple rooms at startup. Omit it to use only `IMVU_ROOM_ID`.

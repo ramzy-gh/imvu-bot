@@ -44,6 +44,8 @@ class StateStore:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 json.dump(value, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.chmod(temp, 0o600)
             temp.replace(self.path)
         finally:

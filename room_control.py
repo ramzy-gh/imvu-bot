@@ -104,9 +104,11 @@ class RoomManager:
             "message": bot.status_message, "chat_ready": bot.chat_ready and bot.connected,
             "participants_recognized": len(bot.members), "chat_diagnostics": bot.diagnostics,
             "ai": bot.social.ai_status, "avatar": bot.appearance,
+            "account_presence": bot.account_presence,
             "playing": radio.current["title"] if radio.current else None,
             "queued": radio.queue.qsize(), "listeners": len(radio.listeners),
             "audio_bytes": radio.bytes_sent, "audio_error": radio.last_error,
+            "encoder_starts": radio.encoder_starts, "track_starts": radio.track_starts,
             "stream_path": f"/rooms/{bot.room}/stream.mp3"}
 
     async def health(self, request):
