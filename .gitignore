@@ -4,3 +4,4 @@ __pycache__/
 *.log
 imvu-session.json
 permissions.json
+.test-deps/

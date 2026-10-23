@@ -161,6 +161,8 @@ class Radio:
         self.idle = True
         self.skip = asyncio.Event()
         self.accepting = False
+        self.last_error = None
+        self.bytes_sent = 0
 
     async def lookup(self, query):
         # Only YouTube search terms / YouTube URLs; no arbitrary remote URL input.
@@ -193,6 +195,8 @@ class Radio:
         self.skip.set()
 
     async def broadcast(self, chunk):
+        if chunk is not None:
+            self.bytes_sent += len(chunk)
         for listener in tuple(self.listeners):
             if listener.full():
                 # Slow listeners reconnect instead of building an unlimited delay.
@@ -240,19 +244,32 @@ class Radio:
             else:
                 args += ["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo"]
             args += ["-vn", "-ac", "2", "-ar", "44100", "-c:a", "libmp3lame",
-                     "-b:a", "128k", "-write_xing", "0", "-f", "mp3", "pipe:1"]
+                     "-b:a", "128k", "-write_xing", "0", "-id3v2_version", "0", "-f", "mp3", "pipe:1"]
             read_task = stop_task = None
             try:
                 self.proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.DEVNULL)
                 if track:
-                    await announce("Now playing: " + track["title"])
+                    # Chat transport failure must not interrupt the audio stream.
+                    with contextlib.suppress(ConnectionError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
+                        await announce("Now playing: " + track["title"])
                 async def pump():
                     while chunk := await self.proc.stdout.read(4096):
                         await self.broadcast(chunk)
                 read_task = asyncio.create_task(pump())
                 stop_task = asyncio.create_task(self.skip.wait())
                 await asyncio.wait({read_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                if read_task.done():
+                    read_task.result()
+                    await self.proc.wait()
+                    if self.proc.returncode:
+                        self.last_error = "Audio source/encoder failed; try another song and rebuild yt-dlp."
+                    else:
+                        self.last_error = None
+            except OSError:
+                self.last_error = "FFmpeg could not start. Install FFmpeg or use the supplied Dockerfile."
+                LOG.error(self.last_error)
+                await asyncio.sleep(5)
             finally:
                 for task in (read_task, stop_task):
                     if task:
@@ -274,12 +291,13 @@ class Radio:
 
 
 class Bot:
-    def __init__(self, radio):
+    def __init__(self, radio, room=None, permissions=None, authentication=None):
         self.radio = radio
-        self.room = os.getenv("IMVU_ROOM_ID", "330286535-177")
+        self.room = room or os.getenv("IMVU_ROOM_ID", "330286535-177")
+        self.authentication = authentication
         if not re.fullmatch(r"\d+-\d+", self.room):
             raise ValueError("IMVU_ROOM_ID must look like 330286535-177")
-        self.permissions = Permissions()
+        self.permissions = permissions if permissions is not None else Permissions()
         self.members = set()
         self.greeted = OrderedDict()
         self.cooldowns = {}
@@ -357,6 +375,12 @@ class Bot:
             LOG.warning("Session could not be saved; ensure SESSION_PATH points to writable persistent storage")
 
     async def login(self, force=False):
+        if self.authentication is not None:
+            await self.authentication.login(self, force)
+        else:
+            await self._login(force)
+
+    async def _login(self, force=False):
         if not force and self.restore_session():
             return
         username = os.getenv("IMVU_USERNAME", "Ramsei")
@@ -591,7 +615,7 @@ class Bot:
                 cmd = ALIASES.get(cmd.lower(), cmd.lower())
                 if not self.permissions.allowed(uid):
                     continue
-                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help"} | MANAGEMENT_COMMANDS:
+                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio"} | MANAGEMENT_COMMANDS:
                     continue
                 now = time.monotonic()
                 if now - self.cooldowns.get(uid, -1000) < 5:
@@ -601,6 +625,10 @@ class Bot:
                     self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < 60}
                 if cmd in MANAGEMENT_COMMANDS:
                     await self.management_command(uid, verified, cmd, query.strip())
+                elif cmd == "!radio":
+                    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+                    path = f"/rooms/{self.room}/stream.mp3"
+                    await self.say("Host/mod: load " + (base + path if base else "your HTTPS host domain + " + path) + " in IMVU Radio, then press Play. Listeners: " + str(len(self.radio.listeners)))
                 elif cmd == "!play":
                     if not query.strip():
                         await self.say("Usage: !play <song name or YouTube link>")
@@ -615,6 +643,8 @@ class Bot:
                     if self.radio.idle:
                         self.radio.interrupt()
                     await self.say("Queued: " + track["title"])
+                    if not self.radio.listeners:
+                        await self.say("No radio listeners connected. Use !radio for the stream setup.")
                 elif cmd in {"!skip", "!stop"}:
                     if cmd == "!stop":
                         while not self.radio.queue.empty():
@@ -629,7 +659,7 @@ class Bot:
                     titles = [t["title"] for t in list(self.radio.queue._queue)[:5]]
                     await self.say("Next: " + " | ".join(titles) if titles else "The queue is empty.")
                 else:
-                    await self.say("🎶 !play <song / اسم الأغنية> | !queue !np !skip !stop | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
+                    await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
             except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError):
                 LOG.warning("A command failed; no credentials or media URLs logged.")
                 with contextlib.suppress(ConnectionError):
@@ -705,41 +735,33 @@ class Bot:
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
-    radio = Radio()
-    bot = Bot(radio)
+    from room_control import RoomManager
+    manager = RoomManager()
     app = web.Application()
-    async def health(request):
-        status = "connected" if bot.connected and bot.chat_ready else "transport_connected" if bot.connected else bot.status
-        return web.json_response({"status": status,
-            "message": bot.status_message,
-            "chat_ready": bot.chat_ready and bot.connected,
-            "participants_recognized": len(bot.members), "chat_diagnostics": bot.diagnostics,
-            "ai": bot.social.ai_status, "avatar": bot.appearance,
-            "room": bot.room, "playing": radio.current["title"] if radio.current else None,
-            "queued": radio.queue.qsize(), "listeners": len(radio.listeners)})
-    app.router.add_get("/health", health)
-    app.router.add_get("/stream.mp3", radio.stream)
+    app.router.add_get("/health", manager.health)
+    app.router.add_get("/stream.mp3", manager.stream)
+    app.router.add_get("/rooms/{room}/stream.mp3", manager.stream)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "3000"))).start()
     if not os.getenv("DATABASE_URL", "").strip():
         LOG.warning("Local state only: Bothost rebuilds erase saved login, admins and blocks. Set DATABASE_URL for durable storage.")
     LOG.info("Radio endpoint /stream.mp3; diagnostic status /health")
-    async def start_radio_after_login():
-        await bot.authenticated.wait()
-        await radio.run(bot.say)
-    tasks = [asyncio.create_task(bot.run()), asyncio.create_task(bot.command_worker()),
-             asyncio.create_task(start_radio_after_login()), asyncio.create_task(bot.social.run())]
+    configured = os.getenv("IMVU_ROOM_IDS", "").strip()
+    rooms = [r.strip() for r in configured.split(",") if r.strip()] if configured else [manager.default_room]
+    terminal = None
     try:
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            task.result()
+        for room in rooms:
+            LOG.info("%s", await manager.join(room))
+        if os.getenv("TERMINAL_CONTROL", "0") == "1":
+            terminal = asyncio.create_task(manager.terminal())
+        await asyncio.Event().wait()
     finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if terminal:
+            terminal.cancel()
+            await asyncio.gather(terminal, return_exceptions=True)
+        await manager.close()
         await runner.cleanup()
-
 
 if __name__ == "__main__":
     try:

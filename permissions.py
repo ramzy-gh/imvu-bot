@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from state_store import StateStore
 
@@ -11,6 +12,7 @@ OWNER_NAME = "Ramzy"
 
 class Permissions:
     def __init__(self):
+        self.lock = threading.RLock()
         self.path = Path(os.getenv("PERMISSIONS_PATH", "/app/data/permissions.json"))
         self.admins = set()
         self.blocked = set()
@@ -71,6 +73,10 @@ class Permissions:
         return self.names.get(uid, "حساب اسمه مش متاح حاليا")
 
     def manage(self, actor, verified, command, target="", username=None):
+        with self.lock:
+            return self._manage(actor, verified, command, target, username)
+
+    def _manage(self, actor, verified, command, target="", username=None):
         """IDs authorize internally; all user-facing output uses usernames."""
         error = self.authorization_error(actor, verified, command)
         if error:

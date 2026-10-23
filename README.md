@@ -123,6 +123,20 @@ a deployment check. No real database has been connected or provisioned.
 
 ## Connect the room radio
 
+Set `PUBLIC_BASE_URL=https://YOUR-BOTHOST-DOMAIN` in the host variables. Type
+`!radio` in the room for that room's stream URL and listener count. A queued song
+does not automatically enable IMVU Radio. A room host/moderator must load the
+stream and press Play; check the radio volume on each client. Classic requires MP3.
+The bot now keeps audio running if a chat announcement fails, removes repeated
+MP3 metadata at song boundaries, and reports encoder failures in `/health`.
+`audio_bytes` increasing confirms encoder output, not audible client playback.
+`listeners=0` means no client is connected to this server's stream.
+The actual cause on your deployed host still needs a live check.
+
+Each room has its own queue and stream:
+`https://YOUR-BOTHOST-DOMAIN/rooms/330286535-177/stream.mp3`.
+`/stream.mp3` remains an alias for the `IMVU_ROOM_ID` room.
+
 After the server works, the room owner/moderator opens **Radio** in Classic,
 loads `https://YOUR-BOTHOST-DOMAIN/stream.mp3`, then clicks Play.
 Use the real domain from your Bothost panel; the example is a placeholder.
@@ -151,6 +165,7 @@ Only play audio you are allowed to share.
 | `!scores` | `!نتيجة` | Your points this session |
 | `!ask <message>` | `!اسال` | Address the AI directly |
 | `!help` | `!مساعدة` | Quick command list |
+| `!radio` | — | Stream setup URL and connected listener count |
 
 ### Owner and admins
 
@@ -195,7 +210,43 @@ Do not delete the permissions file to update code. Remove the previous
 be an initial admin. Once a permissions file exists, it is authoritative; use
 the owner's chat commands to change admins.
 
-## Live acceptance checklist
+## Multiple rooms and host terminal controls
+
+Set `IMVU_ROOM_IDS=330286535-177,OTHEROWNER-OTHERROOM` using real numeric room IDs
+to request multiple rooms at startup. Omit it to use only `IMVU_ROOM_ID`.
+There is a local limit of 10 rooms. Authentication is reused; each room gets
+independent chat, games, music and AI history. Admins and blocks are shared across
+all rooms. AI call limits currently apply per room, so consider the total usage.
+Keep `STATE_NAMESPACE` unchanged. Room selection changes are temporary unless
+you also update `IMVU_ROOM_IDS` in the hosting variables.
+
+For interactive control, set `TERMINAL_CONTROL=1` and run `python bot.py` in a
+foreground terminal with stdin attached. Enter:
+
+```text
+rooms
+join 330286535-177
+leave 330286535-177
+help
+```
+
+`join` requests connection asynchronously; `rooms` and `/health` report readiness.
+`leave` stops that room's tasks/audio and attempts to delete its IMVU presence.
+If IMVU rejects the removal, presence may remain until IMVU expires it.
+Leave then join again to retry a failed room task.
+
+A hosting log viewer or a separate shell does not feed stdin to the running bot.
+Bothost must offer an interactive console attached to that process for these
+commands to work there. With Docker, start interactively using `docker run -it`
+plus your normal environment and port options. Closed stdin disables terminal
+input without stopping the bot. No public remote-control endpoint is added.
+
+Simultaneous presence with one account uses the existing unofficial connector;
+it requires a live IMVU test. IMVU may impose account/room/session limits, and
+the bot cannot override them. Check that it remains visible and responsive in
+two rooms, and that leaving one does not disconnect the other.
+
+### Live checks
 
 - Login succeeds while 2FA remains enabled; no secrets appear in logs.
 - `/health` shows connected and Ramsei visibly appears in the target room.
