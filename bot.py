@@ -8,7 +8,7 @@ import os
 import re
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -166,6 +166,8 @@ class Radio:
         self.pcm = asyncio.Queue(maxsize=5)
         self.encoder_starts = 0
         self.track_starts = 0
+        self.recent_frames = deque(maxlen=10)  # About 260 ms for decoder startup.
+        self.listener_resyncs = 0
 
     async def lookup(self, query):
         # Only YouTube search terms / YouTube URLs; no arbitrary remote URL input.
@@ -202,23 +204,29 @@ class Radio:
     async def broadcast(self, chunk):
         if chunk is not None:
             self.bytes_sent += len(chunk)
+            self.recent_frames.append(chunk)
         for listener in tuple(self.listeners):
             if listener.full():
-                # Slow listeners reconnect instead of building an unlimited delay.
-                self.listeners.discard(listener)
+                # Classic may stay ON AIR after EOF without reconnecting. Drop
+                # stale complete MP3 frames, not the listener's HTTP connection.
                 while not listener.empty():
                     listener.get_nowait()
-                listener.put_nowait(None)
-            else:
-                listener.put_nowait(chunk)
+                self.listener_resyncs += 1
+            listener.put_nowait(chunk)
 
     async def stream(self, request):
-        if len(self.listeners) >= 50:
+        if request.method != "HEAD" and len(self.listeners) >= 50:
             raise web.HTTPServiceUnavailable(text="Listener limit reached")
         response = web.StreamResponse(headers={"Content-Type": "audio/mpeg",
-            "Cache-Control": "no-store", "X-Accel-Buffering": "no", "icy-name": "RAMSEI Radio"})
+            "Cache-Control": "no-store, no-cache, must-revalidate, no-transform",
+            "Pragma": "no-cache", "Expires": "0", "Accept-Ranges": "none",
+            "X-Accel-Buffering": "no", "icy-name": "RAMSEI Radio", "icy-br": "128"})
         await response.prepare(request)
+        if request.method == "HEAD":
+            return response
         listener = asyncio.Queue(maxsize=64)
+        for frame in self.recent_frames:
+            listener.put_nowait(frame)
         self.listeners.add(listener)
         try:
             while True:
@@ -329,9 +337,20 @@ class Radio:
                         await asyncio.sleep(max(0, deadline - now))
 
                 async def pump():
-                    while chunk := await encoder.stdout.read(4096):
-                        await self.broadcast(chunk)
-                    raise RuntimeError("Continuous audio encoder stopped")
+                    # Our encoder emits MPEG-1 Layer III, 128 kb/s, 44.1 kHz.
+                    # Keep frame boundaries so resyncs and late joins never
+                    # start halfway through a frame (bit reservoir is disabled).
+                    while True:
+                        try:
+                            header = await encoder.stdout.readexactly(4)
+                            bits = int.from_bytes(header, "big")
+                            if (bits & 0xFFFEFC00) != 0xFFFA9000:
+                                raise RuntimeError("Unexpected MP3 encoder format")
+                            frame_size = 144000 * 128 // 44100 + ((bits >> 9) & 1)
+                            frame = header + await encoder.stdout.readexactly(frame_size - 4)
+                        except asyncio.IncompleteReadError as error:
+                            raise RuntimeError("Continuous audio encoder stopped") from error
+                        await self.broadcast(frame)
 
                 tasks = [asyncio.create_task(coro) for coro in (feed(), pump(), self.produce_pcm(announce))]
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -345,6 +364,7 @@ class Radio:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await self.stop_process(encoder)
+                self.recent_frames.clear()
                 while not self.pcm.empty():
                     self.pcm.get_nowait()
             await asyncio.sleep(2)

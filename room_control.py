@@ -211,6 +211,7 @@ class RoomManager:
             "queued": radio.queue.qsize(), "listeners": len(radio.listeners),
             "audio_bytes": radio.bytes_sent, "audio_error": radio.last_error,
             "encoder_starts": radio.encoder_starts, "track_starts": radio.track_starts,
+            "listener_resyncs": radio.listener_resyncs,
             "stream_path": f"/rooms/{bot.room}/stream.mp3"}
 
     async def health(self, request):

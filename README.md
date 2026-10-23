@@ -136,12 +136,16 @@ stream and press Play; check the radio volume on each client. Classic requires M
 The bot keeps one MP3 encoder alive across songs, skips and idle silence. Individual
 songs decode to PCM and feed that encoder; song changes do not reset the MP3
 stream. `/health` reports `encoder_starts`, `track_starts` and encoder errors.
+Listeners receive complete MP3 frames and a short startup buffer. If a listener
+falls behind, the server skips stale frames while keeping its connection open;
+`listener_resyncs` in `/health` counts these recoveries. HEAD probes return
+immediately without creating a listener. Responses disable caching and byte ranges.
 The bot cannot press Pause/Play inside other people's IMVU clients. Keeping the
-stream continuous addresses decoder resets at song boundaries; live client
-playback still needs verification.
+stream continuous and preserving slow connections avoids server-induced resets;
+live Classic playback still needs verification after each compatibility change.
 `audio_bytes` increasing confirms encoder output, not audible client playback.
 `listeners=0` means no client is connected to this server's stream.
-The actual cause on your deployed host still needs a live check.
+These diagnostics do not prove that Classic's audio decoder is playing.
 
 Each room has its own queue and stream:
 `https://YOUR-BOTHOST-DOMAIN/rooms/330286535-177/stream.mp3`.
