@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 from personality import ALIASES, Social
-from permissions import Permissions, MANAGEMENT_COMMANDS
+from permissions import Permissions, MANAGEMENT_COMMANDS, normalize_management_message
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
 from wardrobe import load_named_outfit, OutfitError
@@ -573,6 +573,8 @@ class Bot:
             if command:
                 self.diagnostics["accepted_messages"] += 1
                 uid, text, verified = command
+                text = normalize_management_message(text)
+                command = uid, text, verified
                 if not self.permissions.allowed(uid):
                     continue
                 if text.startswith("!") and not self.commands.full():
@@ -611,7 +613,10 @@ class Bot:
         while True:
             uid, text, verified = await self.commands.get()
             try:
-                cmd, _, query = text.partition(" ")
+                text = normalize_management_message(text)
+                parts = text.split(maxsplit=1)
+                cmd = parts[0] if parts else ""
+                query = parts[1] if len(parts) > 1 else ""
                 cmd = ALIASES.get(cmd.lower(), cmd.lower())
                 if not self.permissions.allowed(uid):
                     continue

@@ -191,6 +191,14 @@ Type the actual IMVU **account username**; letter case does not matter, and a
 leading `@` is optional. Decorative display names are not accepted because they
 can be duplicated. The bot resolves the exact username through IMVU, then stores
 the stable account ID internally. You do not need to find or enter that ID.
+Classic may hide the `Guest_` prefix: `!addadmin C4MU` and
+`!addadmin Guest_C4MU` can both resolve the account `Guest_C4MU`.
+Replies/lists show `@Guest_C4MU`, never that account's display name such as `Night`.
+An exact account-name match takes priority over a hidden-Guest alias; ambiguous
+results are rejected. The same rules apply to removeadmin, block and unblock.
+Use `!addadmin C4MU`, `!removeadmin C4MU`, `!block C4MU` or `!unblock C4MU`.
+Slash forms such as `/addadmin C4MU` also work if IMVU delivers them as room chat;
+prefer `!` because clients can consume slash commands before the bot receives them.
 Replies and lists use usernames. If a username is not found or the lookup is
 ambiguous/unavailable, no permission change is made. If someone changes their
 username, their existing admin/block status stays attached to the same account;

@@ -15,13 +15,22 @@ def clean_username(value):
 
 
 def exact_user(data, username):
-    matches = []
+    exact = {}
+    guests = {}
     for url, node in data.get("denormalized", {}).items():
         match = re.fullmatch(r"https://api\.imvu\.com/user/user-([1-9]\d*)", url)
         info = node.get("data", {})
         actual = info.get("username")
-        if match and isinstance(actual, str) and actual.casefold() == username.casefold():
-            matches.append((match[1], actual))
+        if not match or not isinstance(actual, str):
+            continue
+        if actual.casefold() == username.casefold():
+            exact[match[1]] = actual
+        elif (not username.casefold().startswith("guest_")
+                and actual.casefold() == "guest_" + username.casefold()):
+            # Classic may hide Guest_; this is an account-name alias, never
+            # a comparison with display_name (which is non-unique).
+            guests[match[1]] = actual
+    matches = list((exact or guests).items())
     if len(matches) != 1:
         raise UserLookupError("مش لاقي حساب واحد بالاسم ده. اتأكد من اسم الحساب الأصلي بالظبط 🔎")
     return matches[0]

@@ -70,7 +70,8 @@ class Permissions:
         return None
 
     def label(self, uid):
-        return self.names.get(uid, "حساب اسمه مش متاح حاليا")
+        name = self.names.get(uid)
+        return "@" + name if name else "حساب اسمه مش متاح حاليا"
 
     def manage(self, actor, verified, command, target="", username=None):
         with self.lock:
@@ -83,7 +84,7 @@ class Permissions:
             return error
         if command == "!admins":
             names = [self.label(uid) for uid in sorted(self.admins)[:12]]
-            return "👑 Owner: Ramzy | 🛡️ Admins: " + (", ".join(names) or "none")
+            return "👑 Owner: @Ramzy | 🛡️ Admins: " + (", ".join(names) or "none")
         if command == "!blocked":
             names = [self.label(uid) for uid in sorted(self.blocked)[:12]]
             return "🚫 Blocked: " + (", ".join(names) or "none")
@@ -123,3 +124,11 @@ class Permissions:
 
 
 MANAGEMENT_COMMANDS = {"!addadmin", "!removeadmin", "!admins", "!block", "!unblock", "!blocked"}
+
+
+def normalize_management_message(text):
+    """Allow / management commands if the client transmits them as chat."""
+    parts = text.strip().split(maxsplit=1)
+    if parts and parts[0].startswith("/") and "!" + parts[0][1:].lower() in MANAGEMENT_COMMANDS:
+        return "!" + parts[0][1:].lower() + (" " + parts[1] if len(parts) > 1 else "")
+    return text
