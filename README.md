@@ -55,6 +55,9 @@ Example messages:
    entrypoint fixes ownership of that private folder after the host mounts it,
    then runs the bot without root privileges. On hosts without persistent storage,
    configure an external PostgreSQL `DATABASE_URL` instead.
+   The entrypoint redirects the known legacy `/tmp/ramsei` and `/app/data/*.json`
+   session/permission paths to `/app/data/ramsei`. Update the host variables too
+   when possible. This does not recover files already erased by earlier rebuilds.
 7. Deploy. Check `/health` on the assigned domain. It must say `connected` before
    trying room commands. This means transport authentication succeeded; still
    verify actual messages in IMVU.
