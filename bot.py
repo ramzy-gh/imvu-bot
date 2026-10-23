@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 from personality import ALIASES, Social
-from permissions import Permissions, MANAGEMENT_COMMANDS, normalize_management_message
+from permissions import Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normalize_management_message
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
 from wardrobe import load_named_outfit, OutfitError
@@ -351,10 +351,11 @@ class Radio:
 
 
 class Bot:
-    def __init__(self, radio, room=None, permissions=None, authentication=None):
+    def __init__(self, radio, room=None, permissions=None, authentication=None, room_manager=None):
         self.radio = radio
         self.room = room or os.getenv("IMVU_ROOM_ID", "330286535-177")
         self.authentication = authentication
+        self.room_manager = room_manager
         if not re.fullmatch(r"\d+-\d+", self.room):
             raise ValueError("IMVU_ROOM_ID must look like 330286535-177")
         self.permissions = permissions if permissions is not None else Permissions()
@@ -696,7 +697,7 @@ class Bot:
                 cmd = ALIASES.get(cmd.lower(), cmd.lower())
                 if not self.permissions.allowed(uid):
                     continue
-                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio"} | MANAGEMENT_COMMANDS:
+                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
                     continue
                 now = time.monotonic()
                 if now - self.cooldowns.get(uid, -1000) < 5:
@@ -704,7 +705,12 @@ class Bot:
                 self.cooldowns[uid] = now
                 if len(self.cooldowns) > 500:
                     self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < 60}
-                if cmd in MANAGEMENT_COMMANDS:
+                if cmd in ROOM_COMMANDS:
+                    if self.room_manager is None:
+                        await self.say("Room controls are unavailable in this process.")
+                    else:
+                        await self.room_manager.chat_command(self, uid, verified, cmd, query.strip())
+                elif cmd in MANAGEMENT_COMMANDS:
                     await self.management_command(uid, verified, cmd, query.strip())
                 elif cmd == "!radio":
                     base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
@@ -741,6 +747,8 @@ class Bot:
                     await self.say("Next: " + " | ".join(titles) if titles else "The queue is empty.")
                 else:
                     await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
+                    if self.permissions.authorization_error(uid, verified, "!rooms") is None:
+                        await self.say("Owner room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
             except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError):
                 LOG.warning("A command failed; no credentials or media URLs logged.")
                 with contextlib.suppress(ConnectionError):
@@ -829,13 +837,10 @@ async def main():
     if not os.getenv("DATABASE_URL", "").strip():
         LOG.info("File state enabled; keep permissions and login paths on persistent storage (/app/data/ramsei).")
     LOG.info("Radio endpoint /stream.mp3; diagnostic status /health")
-    configured = os.getenv("IMVU_ROOM_IDS", "").strip()
-    rooms = [r.strip() for r in configured.split(",") if r.strip()] if configured else [manager.default_room]
     terminal = None
     control = None
     try:
-        for room in rooms:
-            LOG.info("%s", await manager.join(room))
+        await manager.start()
         if os.getenv("TERMINAL_CONTROL", "0") == "1":
             from local_control import LocalControl
             control = LocalControl(manager.command)

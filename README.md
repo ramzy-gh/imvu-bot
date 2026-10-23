@@ -233,6 +233,33 @@ the owner's chat commands to change admins.
 
 ## Multiple rooms and host terminal controls
 
+### Owner controls from room chat
+
+Only the verified owner account **Ramzy (214900673)** can use these commands.
+Admins cannot use them. Send them from any room the bot has already joined:
+
+```text
+!join 47377071-5395
+!join https://www.imvu.com/next/chat/room-47377071-5395/
+!rooms
+!mainroom
+!leave 47377071-5395
+!leave here
+```
+
+`!join` adds another room while keeping existing rooms connected. `!rooms` shows
+connection status, and marks the main room. `!leave` without an ID means the
+current room. The configured `IMVU_ROOM_ID` (330286535-177) is the protected main
+room: chat and terminal commands cannot make the bot leave it. It reconnects
+normally if IMVU drops the connection. Server shutdown still closes all rooms.
+
+Additional rooms are saved next to the permissions file in `rooms.json` (or in
+PostgreSQL when configured) and restored after restart. A leave request removes
+that room from the saved list. Failed saves do not apply changes. `IMVU_ROOM_IDS`
+seeds the initial list only when no saved room list exists. Use commands for later
+changes. A join request is not a guarantee of access: IMVU must admit the bot.
+Slash versions work only if IMVU passes them to room chat; prefer `!`.
+
 The bot refreshes its own account presence at room connection and about every
 45 seconds, separately from chat membership keepalives. `/health` includes
 `account_presence`. This keeps the online indicator updated while the bot can
@@ -243,8 +270,8 @@ to request multiple rooms at startup. Omit it to use only `IMVU_ROOM_ID`.
 There is a local limit of 10 rooms. Authentication is reused; each room gets
 independent chat, games, music and AI history. Admins and blocks are shared across
 all rooms. AI call limits currently apply per room, so consider the total usage.
-Keep `STATE_NAMESPACE` unchanged. Room selection changes are temporary unless
-you also update `IMVU_ROOM_IDS` in the hosting variables.
+Keep `STATE_NAMESPACE` unchanged. Chat and terminal room changes are saved to
+persistent room storage and restored after restart, including the main room.
 
 For control from a separate shell, set `TERMINAL_CONTROL=1`, restart the bot,
 and run these inside the same bot container (normally `/app`):

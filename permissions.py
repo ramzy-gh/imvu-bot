@@ -67,6 +67,8 @@ class Permissions:
         actor = str(actor)
         if not verified:
             return "لازم أتأكد من هوية الحساب من السيرفر الأول 🔒"
+        if command in ROOM_COMMANDS:
+            return None if actor == OWNER_ID else "Room controls are for owner @Ramzy only."
         if command in {"!addadmin", "!removeadmin"}:
             if actor != OWNER_ID:
                 return "إضافة وحذف الأدمنز لرامزي صاحب البوت بس 👑"
@@ -129,11 +131,12 @@ class Permissions:
 
 
 MANAGEMENT_COMMANDS = {"!addadmin", "!removeadmin", "!admins", "!block", "!unblock", "!blocked"}
+ROOM_COMMANDS = {"!join", "!leave", "!rooms", "!mainroom"}
 
 
 def normalize_management_message(text):
     """Allow / management commands if the client transmits them as chat."""
     parts = text.strip().split(maxsplit=1)
-    if parts and parts[0].startswith("/") and "!" + parts[0][1:].lower() in MANAGEMENT_COMMANDS:
+    if parts and parts[0].startswith("/") and "!" + parts[0][1:].lower() in MANAGEMENT_COMMANDS | ROOM_COMMANDS:
         return "!" + parts[0][1:].lower() + (" " + parts[1] if len(parts) > 1 else "")
     return text

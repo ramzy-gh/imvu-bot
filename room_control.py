@@ -6,14 +6,33 @@ import os
 import re
 import sys
 import stat
+from urllib.parse import urlparse
 
 from aiohttp import web
 from yarl import URL
 
 from bot import API, Bot, Radio
 from permissions import Permissions
+from state_store import StateStore
 
 LOG = logging.getLogger("ramsei.rooms")
+
+
+def room_id(value):
+    value = value.strip()
+    if len(value) > 300:
+        raise ValueError("Use a room ID or an IMVU room link.")
+    if value.startswith("https://"):
+        parsed = urlparse(value)
+        if parsed.netloc not in {"www.imvu.com", "imvu.com"}:
+            raise ValueError("Use an HTTPS IMVU room link, not another website.")
+        match = re.fullmatch(r"/next/chat/room-([1-9]\d*-\d+)/?", parsed.path)
+        if not match:
+            raise ValueError("Use a room ID such as 47377071-5395 or its IMVU room link.")
+        value = match[1]
+    if not re.fullmatch(r"[1-9]\d*-\d+", value):
+        raise ValueError("Room ID must look like 47377071-5395")
+    return value
 
 
 class Authentication:
@@ -49,19 +68,50 @@ class RoomManager:
         self.permissions = Permissions()
         self.authentication = Authentication()
         self.rooms = {}
-        self.default_room = os.getenv("IMVU_ROOM_ID", "330286535-177")
+        self.default_room = room_id(os.getenv("IMVU_ROOM_ID", "330286535-177"))
+        self.room_lock = asyncio.Lock()
+        self.pending = set()
+        self.closing = False
+        self.room_store = StateStore("rooms", os.getenv("ROOMS_PATH", str(self.permissions.path.with_name("rooms.json"))))
+        try:
+            saved = self.room_store.load()
+            configured = os.getenv("IMVU_ROOM_IDS", "").strip()
+            values = saved["rooms"] if saved is not None else [r.strip() for r in configured.split(",") if r.strip()]
+            if not isinstance(values, list) or any(not isinstance(r, str) for r in values):
+                raise ValueError("Invalid room list")
+            self.desired_rooms = {room_id(r) for r in values} | {self.default_room}
+            if len(self.desired_rooms) > 10:
+                raise ValueError("Maximum 10 rooms")
+        except (OSError, ValueError, TypeError, KeyError):
+            raise RuntimeError("Cannot load saved rooms; repair rooms storage before starting.") from None
+
+    async def save_rooms(self, rooms):
+        try:
+            await asyncio.to_thread(self.room_store.save, {"version": 1, "rooms": sorted(rooms)})
+        except OSError:
+            raise ValueError("Could not save room selection. No room change was applied; check persistent storage.") from None
+
+    async def start(self):
+        await self.save_rooms(self.desired_rooms)
+        for room in [self.default_room, *sorted(self.desired_rooms - {self.default_room})]:
+            LOG.info("%s", await self.join(room))
 
     async def join(self, room):
-        if not re.fullmatch(r"[1-9]\d*-\d+", room):
-            raise ValueError("Room ID must look like 330286535-177")
-        if room in self.rooms:
-            return "Already joining/joined " + room
-        if len(self.rooms) >= 10:
-            raise ValueError("Maximum 10 rooms per process")
-        bot = Bot(Radio(), room, self.permissions, self.authentication)
-        task = asyncio.create_task(self.serve(bot), name="room-" + room)
-        self.rooms[room] = (bot, task)
-        return "Join requested for " + room + "; use rooms to check readiness"
+        room = room_id(room)
+        async with self.room_lock:
+            if self.closing:
+                raise ValueError("Bot is shutting down; try again after restart.")
+            if room in self.rooms and not self.rooms[room][1].done():
+                return "Already joining/joined " + room
+            desired = self.desired_rooms | {room}
+            if len(desired) > 10:
+                raise ValueError("Maximum 10 rooms including the main room. Leave an extra room first.")
+            await self.save_rooms(desired)
+            self.desired_rooms = desired
+            bot = Bot(Radio(), room, self.permissions, self.authentication, room_manager=self)
+            task = asyncio.create_task(self.serve(bot), name="room-" + room)
+            self.rooms[room] = (bot, task)
+            return "Join requested for " + room + "; use !rooms to check readiness."
 
     async def serve(self, bot):
         async def audio():
@@ -88,14 +138,66 @@ class RoomManager:
             await bot.radio.broadcast(None)
 
     async def leave(self, room):
+        room = room_id(room)
+        async with self.room_lock:
+            if room == self.default_room:
+                raise ValueError("Main room " + self.default_room + " is protected and always stays connected.")
+            if room not in self.rooms and room not in self.desired_rooms:
+                return "Room is not active: " + room
+            desired = self.desired_rooms - {room}
+            await self.save_rooms(desired)
+            self.desired_rooms = desired
+            await self.stop_room(room)
+            return "Stopped room " + room + " (IMVU presence removal requested)"
+
+    async def stop_room(self, room):
         entry = self.rooms.get(room)
         if entry is None:
-            return "Room is not active: " + room
+            return
         _, task = entry
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         self.rooms.pop(room, None)
-        return "Stopped room " + room + " (IMVU presence removal requested)"
+
+    async def chat_command(self, source, uid, verified, cmd, query):
+        error = self.permissions.authorization_error(uid, verified, cmd)
+        if error:
+            await source.say(error)
+            return
+        if str(uid) not in source.members or not source.connected or not source.chat_ready:
+            await source.say("Owner must be present in this connected room to use room controls.")
+            return
+        try:
+            if cmd == "!mainroom":
+                await source.say("Main room: " + self.default_room + " (protected; always connected).")
+            elif cmd == "!rooms":
+                await source.say("Rooms: " + " | ".join(
+                    ("[MAIN] " if bot.room == self.default_room else "") + bot.room + ": " + self.snapshot(bot)["status"]
+                    for bot, _ in self.rooms.values()))
+            elif cmd == "!join":
+                if not query:
+                    await source.say("Usage: !join ROOM_ID or !join https://www.imvu.com/next/chat/room-OWNER-NUMBER/")
+                    return
+                await source.say(await self.join(query))
+            elif cmd == "!leave":
+                target = room_id(query) if query and query.lower() != "here" else source.room
+                if target == self.default_room:
+                    raise ValueError("Main room " + self.default_room + " is protected and always stays connected.")
+                # A separate task must leave the source room: awaiting it here
+                # would cancel this command worker while it waits on itself.
+                await source.say("Leave requested for " + target + ". Main room remains connected.")
+                async def finish_leave():
+                    try:
+                        result = await self.leave(target)
+                        if source.room != target:
+                            await source.say(result)
+                    except ValueError as error:
+                        await source.say(str(error))
+                task = asyncio.create_task(finish_leave())
+                self.pending.add(task)
+                task.add_done_callback(self.pending.discard)
+        except ValueError as error:
+            await source.say(str(error))
 
     def snapshot(self, bot):
         radio = bot.radio
@@ -114,7 +216,7 @@ class RoomManager:
     async def health(self, request):
         rooms = [self.snapshot(bot) for bot, _ in self.rooms.values()]
         default = next((room for room in rooms if room["room"] == self.default_room), {"status": "not_joined"})
-        return web.json_response({**default, "rooms": rooms})
+        return web.json_response({**default, "main_room": self.default_room, "rooms": rooms})
 
     async def stream(self, request):
         room = request.match_info.get("room", self.default_room)
@@ -193,5 +295,9 @@ class RoomManager:
                 transport.close()
 
     async def close(self):
+        self.closing = True
+        for task in tuple(self.pending):
+            task.cancel()
+        await asyncio.gather(*self.pending, return_exceptions=True)
         for room in list(self.rooms):
-            await self.leave(room)
+            await self.stop_room(room)
