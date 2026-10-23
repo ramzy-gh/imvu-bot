@@ -228,7 +228,23 @@ all rooms. AI call limits currently apply per room, so consider the total usage.
 Keep `STATE_NAMESPACE` unchanged. Room selection changes are temporary unless
 you also update `IMVU_ROOM_IDS` in the hosting variables.
 
-For interactive control, set `TERMINAL_CONTROL=1` and run `python bot.py` in a
+For control from a separate shell, set `TERMINAL_CONTROL=1`, restart the bot,
+and run these inside the same bot container (normally `/app`):
+
+```text
+python botctl.py rooms
+python botctl.py join 47377071-5395
+python botctl.py leave 47377071-5395
+```
+
+This works without stdin attached to the bot process. The running bot listens
+only on loopback with a random authentication token in a private temporary file;
+no public HTTP control endpoint or additional exposed Docker port is added.
+The CLI must run in the same container/network namespace as the bot. If the host's
+terminal is a shell on the Docker node, an operator must use `docker exec` into
+the RAMSEI container before running the CLI. Do not start a second `bot.py` process.
+
+For direct interactive control, set `TERMINAL_CONTROL=1` and run `python bot.py` in a
 foreground terminal with stdin attached. Enter:
 
 ```text
@@ -244,10 +260,11 @@ If IMVU rejects the removal, presence may remain until IMVU expires it.
 Leave then join again to retry a failed room task.
 
 A hosting log viewer or a separate shell does not feed stdin to the running bot.
+Use `python botctl.py ...` from a shell in the bot container instead.
 Bothost must offer an interactive console attached to that process for these
 commands to work there. With Docker, start interactively using `docker run -it`
 plus your normal environment and port options. Closed stdin disables terminal
-input without stopping the bot. No public remote-control endpoint is added.
+input without stopping the bot; the local CLI remains available. No public remote-control endpoint is added.
 
 Simultaneous presence with one account uses the existing unofficial connector;
 it requires a live IMVU test. IMVU may impose account/room/session limits, and

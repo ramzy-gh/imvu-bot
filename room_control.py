@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sys
+import stat
 
 from aiohttp import web
 from yarl import URL
@@ -162,6 +163,10 @@ class RoomManager:
                         chars.append(char)
                         print(char, end="", flush=True)
         else:
+            # Docker normally supplies /dev/null, which epoll cannot watch.
+            if not sys.stdin.isatty() and not stat.S_ISFIFO(os.fstat(sys.stdin.fileno()).st_mode):
+                LOG.info("stdin unavailable; use python botctl.py from the container shell")
+                return
             reader = asyncio.StreamReader()
             try:
                 transport, _ = await asyncio.get_running_loop().connect_read_pipe(

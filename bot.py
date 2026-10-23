@@ -755,13 +755,19 @@ async def main():
     configured = os.getenv("IMVU_ROOM_IDS", "").strip()
     rooms = [r.strip() for r in configured.split(",") if r.strip()] if configured else [manager.default_room]
     terminal = None
+    control = None
     try:
         for room in rooms:
             LOG.info("%s", await manager.join(room))
         if os.getenv("TERMINAL_CONTROL", "0") == "1":
+            from local_control import LocalControl
+            control = LocalControl(manager.command)
+            await control.start()
             terminal = asyncio.create_task(manager.terminal())
         await asyncio.Event().wait()
     finally:
+        if control:
+            await control.close()
         if terminal:
             terminal.cancel()
             await asyncio.gather(terminal, return_exceptions=True)
