@@ -161,6 +161,15 @@ check YouTube availability from the server and the current yt-dlp release.
 No CAPTCHA bypass, proxy rotation or browser-cookie import is included.
 Only play audio you are allowed to share.
 
+Song/artist searches such as `!play billie eilish` show up to five numbered
+YouTube results. The requester replies with a plain number (`1`–`5`) in the same
+room within two minutes to queue that result. Each person and room has separate
+choices; a new search replaces that person's previous list. Selection works
+immediately without the usual command cooldown. If only one result is found,
+it queues directly. An HTTPS YouTube link also queues directly. Long/live results
+are filtered when search metadata is available; the selected video is checked
+again before queuing. The bot does not interrupt a song already playing.
+
 ## Commands
 
 | Command | Arabic alias | What it does |

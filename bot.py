@@ -169,7 +169,8 @@ class Radio:
         self.recent_frames = deque(maxlen=10)  # About 260 ms for decoder startup.
         self.listener_resyncs = 0
 
-    async def lookup(self, query):
+    @staticmethod
+    def lookup_target(query):
         # Only YouTube search terms / YouTube URLs; no arbitrary remote URL input.
         if len(query) > 250 or "\n" in query:
             raise ValueError("Use a shorter song name.")
@@ -181,6 +182,37 @@ class Radio:
             target = query
         else:
             target = "ytsearch1:" + query
+        return target
+
+    async def search(self, query):
+        target = self.lookup_target(query)
+        if not target.startswith("ytsearch1:"):
+            raise ValueError("Search using a song or artist name.")
+        data = json.loads(await capture(sys.executable, "-m", "yt_dlp", "--no-warnings",
+            "--flat-playlist", "--skip-download", "--dump-single-json",
+            "--socket-timeout", "15", "--retries", "1", "--", "ytsearch5:" + query))
+        choices, seen = [], set()
+        for item in data.get("entries", []) or []:
+            if not isinstance(item, dict):
+                continue
+            video_id = item.get("id", "")
+            duration = item.get("duration")
+            if (not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id)
+                    or video_id in seen or item.get("is_live")
+                    or item.get("live_status") in {"is_live", "is_upcoming", "post_live"}
+                    or (isinstance(duration, (int, float)) and (duration <= 0 or duration > 900))):
+                continue
+            seen.add(video_id)
+            choices.append({"title": " ".join(str(item.get("title") or "Unknown track").split())[:140],
+                            "url": "https://www.youtube.com/watch?v=" + video_id})
+            if len(choices) == 5:
+                break
+        if not choices:
+            raise ValueError("No song choices found. Try a more specific song name.")
+        return choices
+
+    async def lookup(self, query):
+        target = self.lookup_target(query)
         data = json.loads(await capture(sys.executable, "-m", "yt_dlp", "--no-warnings",
             "--no-playlist", "--skip-download", "--dump-single-json", "--js-runtimes", "node",
             "--socket-timeout", "15", "--retries", "1", "-f", "bestaudio/best", "--", target))
@@ -382,6 +414,7 @@ class Bot:
         self.members = set()
         self.greeted = OrderedDict()
         self.cooldowns = {}
+        self.song_choices = OrderedDict()
         self.commands = asyncio.Queue(maxsize=50)
         self.ws = None
         self.connected = False
@@ -674,11 +707,12 @@ class Bot:
                 command = uid, text, verified
                 if not self.permissions.allowed(uid):
                     continue
-                if text.startswith("!") and not self.commands.full():
+                picking_song = uid in self.song_choices and self.is_song_number(text)
+                if (text.startswith("!") or picking_song) and not self.commands.full():
                     self.diagnostics["commands_received"] += 1
                     LOG.info("Room command received and queued")
                     self.commands.put_nowait(command)
-                if self.social.interested(text) and not self.social.inbox.full():
+                if not picking_song and self.social.interested(text) and not self.social.inbox.full():
                     self.social.inbox.put_nowait((uid, text))
 
     async def management_command(self, uid, verified, cmd, query):
@@ -706,6 +740,75 @@ class Bot:
             return
         await self.say(await asyncio.to_thread(self.permissions.manage, uid, verified, cmd, target, username=username))
 
+    @staticmethod
+    def is_song_number(text):
+        return re.fullmatch(r"[0-9٠-٩]{1,2}", text.strip()) is not None
+
+    async def queue_song(self, uid, url):
+        if uid not in self.members or not self.permissions.allowed(uid):
+            return False
+        if self.radio.queue.full():
+            await self.say("The music queue is full. Please try later.")
+            return False
+        track = await self.radio.lookup(url)
+        if uid not in self.members or not self.permissions.allowed(uid):
+            return False
+        if self.radio.queue.full():
+            await self.say("The music queue is full. Please try later.")
+            return False
+        self.radio.queue.put_nowait(track)
+        if self.radio.idle:
+            self.radio.interrupt()
+        await self.say("Queued: " + track["title"])
+        if not self.radio.listeners:
+            await self.say("No radio listeners connected. Use !radio for the stream setup.")
+        return True
+
+    async def pick_song(self, uid, text):
+        pending = self.song_choices.get(uid)
+        if pending is None:
+            return
+        expires, choices = pending
+        if time.monotonic() >= expires:
+            self.song_choices.pop(uid, None)
+            await self.say("Your song choices expired. Search again with !play <song or artist>.")
+            return
+        number = int(text.strip())
+        if not 1 <= number <= len(choices):
+            await self.say(f"Pick a number from 1 to {len(choices)} for your song search.")
+            return
+        if await self.queue_song(uid, choices[number - 1]["url"]):
+            self.song_choices.pop(uid, None)
+
+    async def play_request(self, uid, query):
+        self.song_choices.pop(uid, None)
+        if not query:
+            await self.say("Usage: !play <song name, artist or YouTube link>")
+            return
+        if self.radio.queue.full():
+            await self.say("The music queue is full. Please try later.")
+            return
+        target = self.radio.lookup_target(query)
+        if not target.startswith("ytsearch1:"):
+            await self.queue_song(uid, query)
+            return
+        choices = await self.radio.search(query)
+        if uid not in self.members or not self.permissions.allowed(uid):
+            return
+        if len(choices) == 1:
+            await self.queue_song(uid, choices[0]["url"])
+            return
+        now = time.monotonic()
+        self.song_choices = OrderedDict((key, value) for key, value in self.song_choices.items() if value[0] > now)
+        self.song_choices[uid] = (now + 120, choices)
+        while len(self.song_choices) > 100:
+            self.song_choices.popitem(last=False)
+        title = " ".join(query.split())[:40]
+        lines = [f'Song choices for "{title}":']
+        lines.extend(f'{number}. {choice["title"][:52]}' for number, choice in enumerate(choices, 1))
+        lines.append(f"Requester: reply 1-{len(choices)} within 2 minutes.")
+        await self.say("\n".join(lines))
+
     async def command_worker(self):
         while True:
             uid, text, verified = await self.commands.get()
@@ -716,6 +819,11 @@ class Bot:
                 query = parts[1] if len(parts) > 1 else ""
                 cmd = ALIASES.get(cmd.lower(), cmd.lower())
                 if not self.permissions.allowed(uid):
+                    continue
+                if self.is_song_number(text) and uid in self.song_choices:
+                    # A selection must work immediately after its search; the
+                    # normal five-second command cooldown does not apply.
+                    await self.pick_song(uid, text)
                     continue
                 if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
                     continue
@@ -737,21 +845,7 @@ class Bot:
                     path = f"/rooms/{self.room}/stream.mp3"
                     await self.say("Host/mod: load " + (base + path if base else "your HTTPS host domain + " + path) + " in IMVU Radio, then press Play. Listeners: " + str(len(self.radio.listeners)))
                 elif cmd == "!play":
-                    if not query.strip():
-                        await self.say("Usage: !play <song name or YouTube link>")
-                        continue
-                    if self.radio.queue.full():
-                        await self.say("The music queue is full. Please try later.")
-                        continue
-                    track = await self.radio.lookup(query.strip())
-                    if uid not in self.members or not self.permissions.allowed(uid):
-                        continue
-                    self.radio.queue.put_nowait(track)
-                    if self.radio.idle:
-                        self.radio.interrupt()
-                    await self.say("Queued: " + track["title"])
-                    if not self.radio.listeners:
-                        await self.say("No radio listeners connected. Use !radio for the stream setup.")
+                    await self.play_request(uid, query.strip())
                 elif cmd in {"!skip", "!stop"}:
                     if cmd == "!stop":
                         while not self.radio.queue.empty():
@@ -767,6 +861,7 @@ class Bot:
                     await self.say("Next: " + " | ".join(titles) if titles else "The queue is empty.")
                 else:
                     await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
+                    await self.say("Music search: !play <song or artist>, then reply 1-5 to choose. A YouTube link queues directly.")
                     if self.permissions.authorization_error(uid, verified, "!rooms") is None:
                         await self.say("Owner room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
             except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError):
@@ -835,6 +930,7 @@ class Bot:
                 while not self.commands.empty():
                     self.commands.get_nowait()
                     self.commands.task_done()
+                self.song_choices.clear()
                 while not self.social.inbox.empty():
                     self.social.inbox.get_nowait()
                     self.social.inbox.task_done()
