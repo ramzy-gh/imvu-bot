@@ -220,9 +220,12 @@ chat unless an admin has blocked their account from the bot.
 | `!block Username` | Owner/admins | Block a regular account from bot commands, games and AI replies |
 | `!unblock Username` | Owner/admins | Restore access to the bot |
 | `!blocked` | Owner/admins | Show blocked usernames |
+| `!addroomadmin Username` | Ramzy only | Grant room-control access |
+| `!removeroomadmin Username` | Ramzy only | Revoke room-control access |
+| `!roomadmins` | Ramzy only | List accounts with room-control access |
 
 These blocks apply only to this bot; they do not kick someone from the room or
-prevent normal chat. Welcomes still work. Admins cannot block the owner or other
+prevent normal chat. Blocked accounts are not greeted. Admins cannot block the owner or other
 admins. The owner must remove an admin role before that account can be blocked.
 Promoting a blocked regular account also unblocks it. Account usernames/display
 names are never used to grant privileges directly: the owner's fixed numeric ID is used.
@@ -265,8 +268,24 @@ the owner's chat commands to change admins.
 
 ### Owner controls from room chat
 
-Only the verified owner account **Ramzy (214900673)** can use these commands.
-Admins cannot use them. Send them from any room the bot has already joined:
+The verified owner account **Ramzy (214900673)** and accounts explicitly granted
+room-control access can use these commands. Regular admin status alone does not
+grant room control. Send commands from any room the bot has already joined:
+
+Only Ramzy can grant, revoke or list room-control access, using account usernames:
+
+```text
+!addroomadmin C4MU
+!removeroomadmin C4MU
+!roomadmins
+```
+
+Access applies across all the bot's rooms and survives restarts. It permits
+`!join`, `!leave`, `!rooms` and `!mainroom`; it does not grant regular admin powers
+or permission to delegate access. Revocation takes effect for subsequent commands
+in every room. Blocking a delegate suspends use of room controls while blocked.
+Unblock an account before granting it room-control access. The owner retains
+permanent access, and the main room remains protected for everyone.
 
 ```text
 !join 47377071-5395

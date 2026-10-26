@@ -72,6 +72,25 @@ class RoomManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(source.room, self.manager.desired_rooms)
         source.say.assert_called_with("Main room 330286535-177 is protected and always stays connected.")
 
+    async def test_delegated_access_works_across_rooms_and_revocation_is_immediate(self):
+        main = await self.source()
+        self.manager.permissions.manage(OWNER_ID, True, "!addroomadmin", "123", username="Helper")
+        await self.manager.chat_command(main, "123", True, "!join", "123-1")
+        extra = await self.source("123-1")
+        await self.manager.chat_command(extra, "123", True, "!join", "123-2")
+        self.assertIn("123-2", self.manager.rooms)
+        await self.manager.chat_command(extra, "123", True, "!leave", main.room)
+        self.assertIn(main.room, self.manager.rooms)
+        self.assertIn("protected", extra.say.await_args.args[0])
+        await self.manager.chat_command(main, "123", True, "!leave", extra.room)
+        async with asyncio.timeout(2):
+            while extra.room in self.manager.rooms:
+                await asyncio.sleep(.01)
+        self.manager.permissions.manage(OWNER_ID, True, "!removeroomadmin", "123")
+        await self.manager.chat_command(main, "123", True, "!join", "123-3")
+        self.assertNotIn("123-3", self.manager.rooms)
+        self.assertIn("access", main.say.await_args.args[0])
+
     async def test_leave_current_extra_room_does_not_deadlock_worker(self):
         main = await self.source()
         source = await self.source("123-1")

@@ -773,8 +773,9 @@ class Bot:
         if error:
             await self.say(error)
             return
-        if cmd in {"!admins", "!blocked"}:
-            ids = self.permissions.admins if cmd == "!admins" else self.permissions.blocked
+        if cmd in {"!admins", "!blocked", "!roomadmins"}:
+            ids = {"!admins": self.permissions.admins, "!blocked": self.permissions.blocked,
+                   "!roomadmins": self.permissions.room_admins}[cmd]
             for target in sorted(ids)[:12]:
                 try:
                     data = await self.api("GET", f"/user/user-{target}")
@@ -923,7 +924,9 @@ class Bot:
                     await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | !move: come near you | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
                     await self.say("Music search: !play <song or artist>, then reply 1-5 to choose. A YouTube link queues directly.")
                     if self.permissions.authorization_error(uid, verified, "!rooms") is None:
-                        await self.say("Owner room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
+                        await self.say("Room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
+                    if self.permissions.authorization_error(uid, verified, "!addroomadmin") is None:
+                        await self.say("Owner: !addroomadmin Username | !removeroomadmin Username | !roomadmins. Grant or revoke room-control access separately from regular admins.")
             except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError):
                 LOG.warning("A command failed; no credentials or media URLs logged.")
                 with contextlib.suppress(ConnectionError):

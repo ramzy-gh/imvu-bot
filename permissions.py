@@ -15,6 +15,7 @@ class Permissions:
         self.lock = threading.RLock()
         self.path = Path(os.getenv("PERMISSIONS_PATH", "/app/data/ramsei/permissions.json"))
         self.admins = set()
+        self.room_admins = set()
         self.blocked = set()
         self.names = {OWNER_ID: OWNER_NAME}
         self.store = StateStore("permissions", self.path)
@@ -25,6 +26,7 @@ class Permissions:
         if data is not None:
             try:
                 self.admins = self.ids(data["admins"])
+                self.room_admins = self.ids(data.get("room_admins", []))
                 self.blocked = self.ids(data["blocked"])
                 labels = data.get("usernames", {})
                 if not isinstance(labels, dict):
@@ -38,6 +40,7 @@ class Permissions:
             # Optional migration seed, only on the first start without a saved file.
             self.admins = self.ids([s.strip() for s in os.getenv("ADMIN_IDS", "").split(",") if s.strip()])
         self.admins.discard(OWNER_ID)
+        self.room_admins.discard(OWNER_ID)
         self.blocked.difference_update(self.admins | {OWNER_ID})
         self.names[OWNER_ID] = OWNER_NAME
         if data is None:
@@ -59,16 +62,21 @@ class Permissions:
         return str(uid) not in self.blocked
 
     def save(self):
-        relevant = self.admins | self.blocked | {OWNER_ID}
+        relevant = self.admins | self.room_admins | self.blocked | {OWNER_ID}
         self.store.save({"admins": sorted(self.admins), "blocked": sorted(self.blocked),
+            "room_admins": sorted(self.room_admins),
             "usernames": {uid: name for uid, name in self.names.items() if uid in relevant}})
 
     def authorization_error(self, actor, verified, command):
         actor = str(actor)
         if not verified:
             return "لازم أتأكد من هوية الحساب من السيرفر الأول 🔒"
+        if not self.allowed(actor):
+            return "This account is blocked from using the bot."
         if command in ROOM_COMMANDS:
-            return None if actor == OWNER_ID else "Room controls are for owner @Ramzy only."
+            return None if actor == OWNER_ID or actor in self.room_admins else "Room controls require access granted by owner @Ramzy."
+        if command in {"!addroomadmin", "!removeroomadmin", "!roomadmins"}:
+            return None if actor == OWNER_ID else "Only owner @Ramzy can grant, revoke or list room-control access."
         if command in {"!addadmin", "!removeadmin"}:
             if actor != OWNER_ID:
                 return "إضافة وحذف الأدمنز لرامزي صاحب البوت بس 👑"
@@ -95,13 +103,18 @@ class Permissions:
         if command == "!blocked":
             names = [self.label(uid) for uid in sorted(self.blocked)[:12]]
             return "🚫 Blocked: " + (", ".join(names) or "none")
+        if command == "!roomadmins":
+            names = [self.label(uid) for uid in sorted(self.room_admins)[:12]]
+            return "Room-control access: " + (", ".join(names) or "none") + " | Owner: @Ramzy"
         if not re.fullmatch(r"[1-9]\d*", target):
             return f"اكتب اسم الحساب بعد الأمر، مثال: {command} Username 🔎"
         if target == OWNER_ID:
             return "صلاحيات صاحب البوت ثابتة ومينفعش تتغير من الشات 👑"
         if command == "!block" and target in self.admins:
             return "مينفعش تمنع أدمن. صاحب البوت يشيل رتبته الأول 🛡️"
-        before = self.admins.copy(), self.blocked.copy(), self.names.copy()
+        if command == "!addroomadmin" and target in self.blocked:
+            return "That account is blocked. Use !unblock Username before granting room-control access."
+        before = self.admins.copy(), self.room_admins.copy(), self.blocked.copy(), self.names.copy()
         if username is not None:
             if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,40}", username):
                 return "اسم الحساب غير صالح 🔎"
@@ -120,17 +133,24 @@ class Permissions:
         elif command == "!unblock":
             self.blocked.discard(target)
             reply = f"تم السماح لـ {label} باستخدام البوت تاني ✅"
+        elif command == "!addroomadmin":
+            self.room_admins.add(target)
+            reply = f"Granted room-control access to {label}: !join, !leave, !rooms and !mainroom."
+        elif command == "!removeroomadmin":
+            self.room_admins.discard(target)
+            reply = f"Removed room-control access from {label}."
         else:
             return "Unknown management command"
         try:
             self.save()
         except OSError:
-            self.admins, self.blocked, self.names = before
+            self.admins, self.room_admins, self.blocked, self.names = before
             return "التغيير متحفظش، فمرجعتش أطبقه. راجع صلاحية فولدر البيانات 🔧"
         return reply
 
 
-MANAGEMENT_COMMANDS = {"!addadmin", "!removeadmin", "!admins", "!block", "!unblock", "!blocked"}
+MANAGEMENT_COMMANDS = {"!addadmin", "!removeadmin", "!admins", "!block", "!unblock", "!blocked",
+                       "!addroomadmin", "!removeroomadmin", "!roomadmins"}
 ROOM_COMMANDS = {"!join", "!leave", "!rooms", "!mainroom"}
 
 

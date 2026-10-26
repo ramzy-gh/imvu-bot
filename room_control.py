@@ -165,7 +165,7 @@ class RoomManager:
             await source.say(error)
             return
         if str(uid) not in source.members or not source.connected or not source.chat_ready:
-            await source.say("Owner must be present in this connected room to use room controls.")
+            await source.say("You must be present in this connected room to use room controls.")
             return
         try:
             if cmd == "!mainroom":
