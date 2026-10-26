@@ -9,6 +9,7 @@ COPY bot.py personality.py permissions.py identity.py state_store.py ./
 COPY offline_chat.py offline_seed.txt ./
 COPY wardrobe.py ./
 COPY movement.py ./
+COPY telegram_bridge.py ./
 COPY room_control.py ./
 COPY local_control.py botctl.py ./
 RUN useradd --create-home bot && mkdir -p /app/data && chown -R bot:bot /app

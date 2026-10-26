@@ -4,3 +4,4 @@ __pycache__
 tests
 data
 *.json.tmp
+telegram-bridge.json

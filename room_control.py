@@ -72,6 +72,7 @@ class RoomManager:
         self.room_lock = asyncio.Lock()
         self.pending = set()
         self.closing = False
+        self.telegram = None
         self.room_store = StateStore("rooms", os.getenv("ROOMS_PATH", str(self.permissions.path.with_name("rooms.json"))))
         try:
             saved = self.room_store.load()
@@ -95,6 +96,9 @@ class RoomManager:
         await self.save_rooms(self.desired_rooms)
         for room in [self.default_room, *sorted(self.desired_rooms - {self.default_room})]:
             LOG.info("%s", await self.join(room))
+        from telegram_bridge import TelegramBridge
+        self.telegram = TelegramBridge(self)
+        await self.telegram.start()
 
     async def join(self, room):
         room = room_id(room)
@@ -217,7 +221,8 @@ class RoomManager:
     async def health(self, request):
         rooms = [self.snapshot(bot) for bot, _ in self.rooms.values()]
         default = next((room for room in rooms if room["room"] == self.default_room), {"status": "not_joined"})
-        return web.json_response({**default, "main_room": self.default_room, "rooms": rooms})
+        return web.json_response({**default, "main_room": self.default_room, "rooms": rooms,
+                                  "telegram": self.telegram.snapshot() if self.telegram else {"state": "disabled"}})
 
     async def stream(self, request):
         room = request.match_info.get("room", self.default_room)
@@ -297,6 +302,8 @@ class RoomManager:
 
     async def close(self):
         self.closing = True
+        if self.telegram:
+            await self.telegram.close()
         for task in tuple(self.pending):
             task.cancel()
         await asyncio.gather(*self.pending, return_exceptions=True)

@@ -266,6 +266,47 @@ the owner's chat commands to change admins.
 
 ## Multiple rooms and host terminal controls
 
+### Private Telegram chat bridge
+
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_OWNER_ID` in the hosting environment. The
+owner ID must be the positive numeric ID of your Telegram account, verified from
+a setup message sent from that account to your bot. Start the bot in Telegram
+before enabling the bridge. Never commit the token. No webhook is needed; an
+existing webhook is detected and left unchanged.
+
+The bridge sends public chat from all connected IMVU rooms to the owner's private
+Telegram conversation. Each forwarded message identifies its room and account
+usernames. System/avatar protocol messages and private whispers are excluded.
+Feature-blocked accounts' public chat is still relayed. RAMSEI's ordinary replies
+are included. Messages from one room may be batched into one Telegram message.
+
+- Reply to a forwarded Telegram message to send chat to its original room.
+- `/rooms` lists active rooms and their connection status.
+- `/say ROOM_ID message` sends to an explicitly chosen room.
+- `/help` explains the commands.
+
+Replies appear in IMVU as `Ramzy (Telegram): message`, spoken by RAMSEI. There is
+no implicit default room. Only messages from the pinned owner in that owner's
+private chat are accepted; group chats and other senders cannot control the bot.
+Replies are plain text, up to 430 characters. Avatar/system actions are rejected.
+Telegram does not gain IMVU permission-management or room-control commands.
+
+An owner-only local state file (`TELEGRAM_STATE_PATH`, default
+`/app/data/ramsei/telegram-bridge.json`) stores the pending outbox, recent message
+routes and Telegram update cursor. Keep it on persistent storage. Pending logs
+survive normal restarts; up to 500 individual chat messages are queued during an
+outage. Further messages are counted as dropped in `/health` rather than blocking
+IMVU chat. The most recent 2,000 forwarded Telegram messages retain reply routing;
+use `/say` for older ones. A hard crash during delivery can duplicate a forwarded
+log. Telegram replies are claimed before sending to IMVU so restart recovery does
+not replay them; if interrupted, resend only after checking the room.
+
+This relays live messages received while RAMSEI is connected, not historical chat
+from when the bot was offline. Telegram/network failures do not stop the rooms.
+`/health` exposes bridge state and queue/drop counts, without credentials or chats.
+Changing the pinned owner/bot requires deliberately migrating or clearing the
+private bridge state; it will not forward old logs to a different account.
+
 ### Owner controls from room chat
 
 The verified owner account **Ramzy (214900673)** and accounts explicitly granted

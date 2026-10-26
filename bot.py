@@ -579,6 +579,9 @@ class Bot:
                 self.pending_chat_ops.discard(min(self.pending_chat_ops))
             self.diagnostics["messages_sent"] += 1
             self.last_said = time.monotonic()
+            bridge = getattr(self.room_manager, "telegram", None)
+            if bridge:
+                bridge.record(self.room, self.user_id, text, os.getenv("IMVU_USERNAME", "Ramsei"))
             return True
 
     async def participants(self, greet=False):
@@ -756,6 +759,12 @@ class Bot:
             if command:
                 self.diagnostics["accepted_messages"] += 1
                 uid, text, verified = command
+                bridge = getattr(self.room_manager, "telegram", None)
+                if bridge:
+                    # Relay public chat before feature blocks or command aliases
+                    # change it. Private whispers and system actions are excluded
+                    # by decode_message, and own messages are relayed by say().
+                    bridge.record(self.room, uid, text)
                 text = normalize_management_message(text)
                 command = uid, text, verified
                 if not self.permissions.allowed(uid):
