@@ -285,7 +285,7 @@ are included. Messages from one room may be batched into one Telegram message.
 - `/say ROOM_ID message` sends to an explicitly chosen room.
 - `/help` explains the commands.
 
-Replies appear in IMVU as `Ramzy (Telegram): message`, spoken by RAMSEI. There is
+Replies appear in IMVU as normal RAMSEI messages, without a Telegram prefix. There is
 no implicit default room. Only messages from the pinned owner in that owner's
 private chat are accepted; group chats and other senders cannot control the bot.
 Replies are plain text, up to 430 characters. Avatar/system actions are rejected.

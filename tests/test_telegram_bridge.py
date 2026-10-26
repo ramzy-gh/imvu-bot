@@ -40,7 +40,7 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
     async def test_reply_routes_only_to_original_room(self):
         self.bridge.routes["10"] = "123-2"
         await self.bridge.handle_message(self.message("hello everyone", 10))
-        self.second.say.assert_awaited_once_with("Ramzy (Telegram): hello everyone")
+        self.second.say.assert_awaited_once_with("hello everyone")
         self.first.say.assert_not_awaited()
 
     async def test_explicit_room_and_no_implicit_default_room(self):
@@ -48,7 +48,7 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
         self.first.say.assert_not_awaited()
         self.second.say.assert_not_awaited()
         await self.bridge.handle_message(self.message("/say 123-1 hello"))
-        self.first.say.assert_awaited_once_with("Ramzy (Telegram): hello")
+        self.first.say.assert_awaited_once_with("hello")
         await self.bridge.handle_message(self.message("/say 123-3 hello"))
         self.assertIn("Nothing was sent", self.bridge.notify.await_args.args[0])
 

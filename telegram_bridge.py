@@ -17,7 +17,7 @@ LOG = logging.getLogger("ramsei.telegram")
 ROOM = re.compile(r"[1-9]\d*-\d+")
 HELP = ("RAMSEI room bridge\nReply to a forwarded message to speak in that room.\n"
         "/rooms — list connected rooms\n/say ROOM_ID message — send to a specific room\n"
-        "Replies appear as Ramzy (Telegram), sent by RAMSEI. Maximum 430 characters.")
+        "Replies appear as normal messages sent by RAMSEI. Maximum 430 characters.")
 
 
 class TelegramError(RuntimeError):
@@ -233,7 +233,7 @@ class TelegramBridge:
             await self.notify("Room " + room + " is not connected. Nothing was sent.")
             return
         try:
-            sent = await entry[0].say("Ramzy (Telegram): " + body)
+            sent = await entry[0].say(body)
         except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
             sent = False
         await self.notify(("Sent to room " if sent else "Could not send to room ") + room + ".")
