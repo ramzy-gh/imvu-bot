@@ -20,6 +20,7 @@ from permissions import Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normali
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
 from wardrobe import load_named_outfit, OutfitError
+from movement import Movement
 
 LOG = logging.getLogger("ramsei")
 API = "https://api.imvu.com"
@@ -413,6 +414,10 @@ class Bot:
         self.permissions = permissions if permissions is not None else Permissions()
         self.members = set()
         self.greeted = OrderedDict()
+        self.pending_welcomes = OrderedDict()
+        self.members_initialized = False
+        self.welcome_lock = asyncio.Lock()
+        self.movement = Movement(self)
         self.cooldowns = {}
         self.song_choices = OrderedDict()
         self.commands = asyncio.Queue(maxsize=50)
@@ -559,11 +564,11 @@ class Bot:
 
     async def say(self, text):
         if not self.connected:
-            return
+            return False
         async with self.say_lock:
             await asyncio.sleep(max(0, self.last_said + 1.5 - time.monotonic()))
             if not self.connected:
-                return
+                return False
             operation = await self.packet("msg_c2g_send_message", queue=self.queue, mount="messages",
                 message=encode({"chatId": self.queue.rsplit("/", 1)[-1], "message": text[:450],
                                 "to": 0, "userId": self.user_id}))
@@ -573,32 +578,61 @@ class Bot:
                 self.pending_chat_ops.discard(min(self.pending_chat_ops))
             self.diagnostics["messages_sent"] += 1
             self.last_said = time.monotonic()
+            return True
 
     async def participants(self, greet=False):
         path = f"/chat/chat-{self.room}/participants"
         data = await self.api("GET", path)
         new = participant_ids(data, API + path)
         self.last_membership_refresh = time.monotonic()
+        if self.members_initialized:
+            for uid in sorted(new - self.members - {self.user_id}):
+                self.pending_welcomes[uid] = time.monotonic()
+        self.members_initialized = True
+        # Update membership before profile lookups or chat sends. Even a refresh
+        # from receive() must retain arrivals for the next greeting pass.
+        self.members = new
+        self.pending_welcomes = OrderedDict((uid, joined) for uid, joined in self.pending_welcomes.items()
+                                           if uid in new and time.monotonic() - joined < 120)
+        while len(self.pending_welcomes) > 500:
+            self.pending_welcomes.popitem(last=False)
         if not greet:
             LOG.info("Membership loaded: %s participants recognized", len(new))
         if greet:
-            if new - self.members - {self.user_id} and self.chat_ready:
-                await self.announce_appearance()
-            for uid in sorted(new - self.members - {self.user_id}):
-                now = time.monotonic()
-                if now - self.greeted.get(uid, -1000) < 300:
+            await self.send_welcomes()
+
+    async def send_welcomes(self):
+        async with self.welcome_lock:
+            if not self.connected or not self.chat_ready:
+                return
+            for uid in list(self.pending_welcomes):
+                if uid not in self.members or uid == self.user_id or not self.permissions.allowed(uid):
+                    self.pending_welcomes.pop(uid, None)
                     continue
-                self.greeted[uid] = now
-                self.greeted.move_to_end(uid)
-                while len(self.greeted) > 500:
-                    self.greeted.popitem(last=False)
-                user = await self.api("GET", f"/user/user-{uid}")
-                info = user.get("denormalized", {}).get(API + f"/user/user-{uid}", {}).get("data", {})
-                name = info.get("username") or info.get("display_name") or "friend"
-                # Named English welcomes are fixed even if an old Arabic override exists.
-                safe_name = re.sub(r"[\x00-\x1f\x7f]", "", str(name))[:60] or "friend"
-                await self.say(f"Welcome, {safe_name}! Great to have you here! Music: !play | Games: !game")
-        self.members = new
+                if time.monotonic() - self.greeted.get(uid, -1000) < 300:
+                    self.pending_welcomes.pop(uid, None)
+                    continue
+                try:
+                    user = await self.api("GET", f"/user/user-{uid}")
+                    info = user.get("denormalized", {}).get(API + f"/user/user-{uid}", {}).get("data", {})
+                    name = info.get("username")
+                    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,40}", name):
+                        continue
+                    if uid not in self.members or not self.permissions.allowed(uid):
+                        self.pending_welcomes.pop(uid, None)
+                        continue
+                    sent = await self.say(f"Welcome, @{name}! Great to have you here! Music: !play <song or artist> | Games: !game")
+                    if not sent:
+                        continue
+                    self.pending_welcomes.pop(uid, None)
+                    self.greeted[uid] = time.monotonic()
+                    self.greeted.move_to_end(uid)
+                    while len(self.greeted) > 500:
+                        self.greeted.popitem(last=False)
+                except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, ValueError):
+                    # Retry this greeting later without disconnecting the room
+                    # or preventing other arrivals from being welcomed.
+                    LOG.warning("Welcome deferred in room %s; will retry.", self.room)
 
     async def update_account_presence(self):
         try:
@@ -613,12 +647,16 @@ class Bot:
             LOG.warning("Account presence update failed; will retry on the next heartbeat")
 
     async def presence(self):
+        last_keepalive = -1000
         while True:
-            await asyncio.sleep(15)
-            await self.packet("msg_c2g_ping")
-            if time.monotonic() - self.last_account_presence >= 45:
+            await asyncio.sleep(5)
+            now = time.monotonic()
+            if now - last_keepalive >= 15:
+                await self.packet("msg_c2g_ping")
+                await self.api("POST", f"/chat/chat-{self.room}/participants/user-{self.user_id}", json={})
+                last_keepalive = now
+            if now - self.last_account_presence >= 45:
                 await self.update_account_presence()
-            await self.api("POST", f"/chat/chat-{self.room}/participants/user-{self.user_id}", json={})
             await self.participants(greet=True)
 
     async def announce_appearance(self):
@@ -825,7 +863,7 @@ class Bot:
                     # normal five-second command cooldown does not apply.
                     await self.pick_song(uid, text)
                     continue
-                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
+                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio", "!move"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
                     continue
                 now = time.monotonic()
                 if now - self.cooldowns.get(uid, -1000) < 5:
@@ -846,6 +884,13 @@ class Bot:
                     await self.say("Host/mod: load " + (base + path if base else "your HTTPS host domain + " + path) + " in IMVU Radio, then press Play. Listeners: " + str(len(self.radio.listeners)))
                 elif cmd == "!play":
                     await self.play_request(uid, query.strip())
+                elif cmd == "!move":
+                    if query.strip():
+                        await self.say("Type !move by itself and I'll look for a free spot near you.")
+                    else:
+                        reply = await self.movement.move_near(uid)
+                        if reply:
+                            await self.say(reply)
                 elif cmd in {"!skip", "!stop"}:
                     if cmd == "!stop":
                         while not self.radio.queue.empty():
@@ -860,7 +905,7 @@ class Bot:
                     titles = [t["title"] for t in list(self.radio.queue._queue)[:5]]
                     await self.say("Next: " + " | ".join(titles) if titles else "The queue is empty.")
                 else:
-                    await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
+                    await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | !move: come near you | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
                     await self.say("Music search: !play <song or artist>, then reply 1-5 to choose. A YouTube link queues directly.")
                     if self.permissions.authorization_error(uid, verified, "!rooms") is None:
                         await self.say("Owner room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")

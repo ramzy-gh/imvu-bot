@@ -172,6 +172,19 @@ again before queuing. The bot does not interrupt a song already playing.
 
 ## Commands
 
+`!move` asks RAMSEI to move its own avatar near the caller. It reads actual seat
+coordinates from the room/furniture skeleton and chooses the closest unoccupied
+seat on the caller's current room shell or furniture item. It never moves another
+user or guesses seat numbers. If that item has no free seat, it reports that.
+Animated furniture may differ from its base skeleton positions. Requests have a
+10-second cooldown per room. IMVU must confirm the new seat before success is reported.
+
+Welcomes are checked every five seconds and tracked separately in each room. New arrivals receive an English
+welcome using their account username. Membership refreshes triggered by chat also
+retain pending welcomes. Temporary lookup/send failures retry for up to two minutes
+without disconnecting the room; rapid rejoins have a five-minute greeting cooldown.
+People already present when the bot first joins are not greeted as new arrivals.
+
 | Command | Arabic alias | What it does |
 | --- | --- | --- |
 | `!play <song / YouTube link>` | `!شغل` | First matching result, max 15 minutes |
