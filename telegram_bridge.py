@@ -1,10 +1,11 @@
-"""Private owner-only Telegram relay, shared by all IMVU room workers."""
+"""Owner-controlled Telegram relay with revocable read-only viewers."""
 import asyncio
 import contextlib
 import logging
 import math
 import os
 import re
+import secrets
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ LOG = logging.getLogger("ramsei.telegram")
 ROOM = re.compile(r"[1-9]\d*-\d+")
 HELP = ("RAMSEI room bridge\nReply to a forwarded message to speak in that room.\n"
         "/rooms — list connected rooms\n/say ROOM_ID message — send to a specific room\n"
+        "/addviewer TELEGRAM_ID — grant read-only logs for all rooms\n"
+        "/removeviewer TELEGRAM_ID — revoke access\n/viewers — list viewers\n"
         "Replies appear as normal messages sent by RAMSEI. Maximum 430 characters.")
 
 
@@ -44,6 +47,11 @@ class TelegramBridge:
         self.outbox = []
         self.routes = OrderedDict()
         self.names = OrderedDict()
+        self.viewers = {}
+        self.viewer_queues = {}
+        self.viewer_tasks = {}
+        self.viewer_locks = {}
+        self.requests = OrderedDict()
         self.wake = asyncio.Event()
         self.save_lock = asyncio.Lock()
         self.dropped = 0
@@ -55,7 +63,8 @@ class TelegramBridge:
     async def persist(self):
         async with self.save_lock:
             payload = {"owner": self.owner, "bot": self.bot_id, "offset": self.offset,
-                       "sequence": self.sequence, "outbox": list(self.outbox), "routes": dict(self.routes)}
+                       "sequence": self.sequence, "outbox": list(self.outbox), "routes": dict(self.routes),
+                       "viewers": {uid: dict(info) for uid, info in self.viewers.items()}}
             # Cancellation must not release the lock while its file/DB write is
             # still running in a thread (shutdown saves use the same temp file).
             write = asyncio.create_task(asyncio.to_thread(self.store.save, payload))
@@ -94,6 +103,17 @@ class TelegramBridge:
                                           if str(k).isdigit() and isinstance(v, str) and ROOM.fullmatch(v))
                 while len(self.routes) > 2000:
                     self.routes.popitem(last=False)
+                viewers = saved.get("viewers", {})
+                if not isinstance(viewers, dict) or len(viewers) > 10:
+                    raise ValueError("Invalid viewer list")
+                for uid, info in viewers.items():
+                    if (not isinstance(uid, str) or not re.fullmatch(r"[1-9]\d*", uid) or int(uid) == self.owner
+                            or not isinstance(info, dict) or type(info.get("since")) is not int
+                            or info["since"] < 1 or not isinstance(info.get("label"), str)
+                            or len(info["label"]) > 80 or not isinstance(info.get("generation"), str)
+                            or not re.fullmatch(r"[a-f0-9]{24}", info["generation"])):
+                        raise ValueError("Invalid viewer entry")
+                self.viewers = viewers
             await self.persist()
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             self.enabled = False
@@ -134,6 +154,118 @@ class TelegramBridge:
         return await self.call("sendMessage", chat_id=self.owner, text=text,
                                link_preview_options={"is_disabled": True})
 
+    async def tell(self, uid, text):
+        return await self.call("sendMessage", chat_id=int(uid), text=text,
+                               link_preview_options={"is_disabled": True})
+
+    def fanout(self, room, formatted):
+        # The event sequence prevents newly approved viewers from receiving
+        # older room messages that happen to remain in the owner's outbox.
+        for uid, info in list(self.viewers.items()):
+            lines = [line for event_id, line in formatted if event_id >= info["since"]]
+            if not lines:
+                continue
+            if uid not in self.viewer_tasks or self.viewer_tasks[uid].done():
+                queue = asyncio.Queue(maxsize=100)
+                self.viewer_queues[uid] = queue
+                self.viewer_tasks[uid] = asyncio.create_task(
+                    self.deliver_viewer(uid, info["generation"], queue), name="telegram-viewer")
+            queue = self.viewer_queues[uid]
+            if queue.full():
+                queue.get_nowait()  # A slow viewer never blocks the owner.
+            queue.put_nowait("[IMVU room " + room + "]\n" + "\n".join(lines))
+
+    async def deliver_viewer(self, uid, generation, queue):
+        lock = self.viewer_locks.setdefault(uid, asyncio.Lock())
+        while True:
+            text = await queue.get()
+            try:
+                async with lock:
+                    current = self.viewers.get(uid)
+                    if not current or current["generation"] != generation:
+                        return
+                    await self.call("sendMessage", chat_id=int(uid), text=text,
+                                    disable_notification=True, link_preview_options={"is_disabled": True})
+            except TelegramError as error:
+                # Viewer delivery is best effort and independent of owner logs.
+                await asyncio.sleep(error.delay)
+            await asyncio.sleep(1.05)
+
+    async def viewer_command(self, command, text):
+        if command == "/viewers":
+            rows = [uid + " — " + info["label"] for uid, info in sorted(self.viewers.items())]
+            await self.notify("Read-only viewers (all connected rooms):\n" + ("\n".join(rows) or "none"))
+            return
+        parts = text.split()
+        if len(parts) != 2 or not re.fullmatch(r"[1-9]\d*", parts[1]):
+            await self.notify("Use " + command + " TELEGRAM_ID. Ask your friend to press Start on this bot to get their ID.")
+            return
+        uid = parts[1]
+        if int(uid) == self.owner:
+            await self.notify("Your owner access is permanent. These commands only manage read-only viewers.")
+            return
+        lock = self.viewer_locks.setdefault(uid, asyncio.Lock())
+        async with lock:
+            if command == "/removeviewer":
+                previous = self.viewers.pop(uid, None)
+                try:
+                    await self.persist()
+                except OSError:
+                    if previous is not None:
+                        self.viewers[uid] = previous
+                    await self.notify("Could not save this change. Viewer access was not changed.")
+                    return
+                task = self.viewer_tasks.pop(uid, None)
+                if task:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                self.viewer_queues.pop(uid, None)
+                await self.notify("Removed viewer " + uid + ". No further logs will be sent. Previously delivered messages remain in their Telegram.")
+                return
+            if uid in self.viewers:
+                await self.notify("That account already has read-only access.")
+                return
+            if len(self.viewers) >= 10:
+                await self.notify("Maximum 10 viewers. Remove one before adding another.")
+                return
+            try:
+                chat = await self.call("getChat", chat_id=int(uid))
+                if chat.get("id") != int(uid) or chat.get("type") != "private":
+                    raise TelegramError()
+            except TelegramError:
+                await self.notify("I can't reach that private account. Ask your friend to open this bot and press Start first, then use their numeric Telegram ID.")
+                return
+            label = "@" + chat["username"] if isinstance(chat.get("username"), str) and re.fullmatch(
+                r"[A-Za-z0-9_]{1,40}", chat["username"]) else " ".join(str(chat.get("first_name") or "Telegram account").split())[:80]
+            self.viewers[uid] = {"since": self.sequence + 1, "generation": secrets.token_hex(12), "label": label}
+            try:
+                await self.persist()
+            except OSError:
+                self.viewers.pop(uid, None)
+                await self.notify("Could not save this change. Viewer access was not granted.")
+                return
+        with contextlib.suppress(TelegramError):
+            await self.tell(uid, "You have read-only access to RAMSEI's live room logs. You cannot send room replies or manage access.")
+        await self.notify("Added " + label + " (" + uid + ") as a read-only viewer for ALL connected rooms. Remove with /removeviewer " + uid)
+
+    async def non_owner(self, uid, command, sender):
+        if command not in {"/start", "/help", "/id"}:
+            if str(uid) in self.viewers:
+                await self.tell(uid, "Read-only access: replies, room commands and access management are owner-only.")
+            return
+        if str(uid) in self.viewers:
+            await self.tell(uid, "You have read-only access to room logs. Your Telegram ID: " + str(uid))
+            return
+        await self.tell(uid, "Your Telegram ID: " + str(uid) + ". Ask the owner to type /addviewer " + str(uid) + ". No room logs are shared until they approve you.")
+        if command == "/start" and time.monotonic() - self.requests.get(uid, -10000) >= 3600:
+            self.requests[uid] = time.monotonic()
+            self.requests.move_to_end(uid)
+            while len(self.requests) > 100:
+                self.requests.popitem(last=False)
+            name = sender.get("username")
+            label = "@" + name if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_]{1,40}", name) else "Telegram account"
+            await self.notify("Read-only access request from " + label + " (ID " + str(uid) + ").\nTo share live logs from ALL connected rooms, type /addviewer " + str(uid) + ".\nNo access has been granted yet.")
+
     async def username(self, event):
         if event.get("name"):
             return "@" + event["name"]
@@ -167,7 +299,7 @@ class TelegramBridge:
             try:
                 await self.persist()
                 room = self.outbox[0]["room"]
-                lines, selected = ["[IMVU room " + room + "]"], []
+                lines, selected, formatted = ["[IMVU room " + room + "]"], [], []
                 for event in list(self.outbox):
                     if event["room"] != room:
                         continue
@@ -177,6 +309,7 @@ class TelegramBridge:
                         break
                     lines.append(line)
                     selected.append(event["id"])
+                    formatted.append((event["id"], line))
                     if len(selected) >= 8:
                         break
                 sent = await self.call("sendMessage", chat_id=self.owner, text="\n".join(lines),
@@ -190,6 +323,7 @@ class TelegramBridge:
                 ids = frozenset(selected)
                 self.outbox = [event for event in self.outbox if event["id"] not in ids]
                 await self.persist()
+                self.fanout(room, formatted)
                 self.state = "connected"
                 await asyncio.sleep(1.05)
             except (TelegramError, OSError) as error:
@@ -199,11 +333,18 @@ class TelegramBridge:
 
     async def handle_message(self, message):
         sender, chat = message.get("from", {}), message.get("chat", {})
-        if (sender.get("id") != self.owner or sender.get("is_bot") or chat.get("id") != self.owner
+        uid = sender.get("id")
+        if (type(uid) is not int or uid <= 0 or sender.get("is_bot") or chat.get("id") != uid
                 or chat.get("type") != "private"):
             return
         text = message.get("text", "").strip()
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+        if uid != self.owner:
+            await self.non_owner(uid, command, sender)
+            return
+        if command in {"/addviewer", "/removeviewer", "/viewers"}:
+            await self.viewer_command(command, text)
+            return
         if command in {"/start", "/help"}:
             await self.notify(HELP)
             return
@@ -291,6 +432,11 @@ class TelegramBridge:
         if self.task:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        for task in self.viewer_tasks.values():
+            task.cancel()
+        await asyncio.gather(*self.viewer_tasks.values(), return_exceptions=True)
+        self.viewer_tasks.clear()
+        self.viewer_queues.clear()
         if self.enabled:
             with contextlib.suppress(OSError):
                 await self.persist()

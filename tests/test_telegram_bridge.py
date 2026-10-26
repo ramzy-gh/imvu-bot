@@ -171,3 +171,107 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
         await bot.receive()
         self.assertEqual(self.bridge.outbox[0]["text"], "hello")
         self.assertTrue(bot.commands.empty())
+
+    async def test_owner_grants_persistent_read_only_viewer_and_lists_them(self):
+        async def call(method, **kwargs):
+            if method == "getChat":
+                return {"id": 222222, "type": "private", "username": "Friend"}
+            return {"message_id": 1}
+        self.bridge.call = AsyncMock(side_effect=call)
+        await self.bridge.handle_message(self.message("/addviewer 222222"))
+        self.assertEqual(self.bridge.viewers["222222"]["label"], "@Friend")
+        await self.bridge.handle_message(self.message("/viewers"))
+        self.assertIn("222222 — @Friend", self.bridge.notify.await_args.args[0])
+        restarted = TelegramBridge(self.manager)
+        with patch.object(restarted, "run", AsyncMock()):
+            await restarted.start()
+            await restarted.close()
+        self.assertEqual(restarted.viewers, self.bridge.viewers)
+
+    async def test_viewer_cannot_reply_delegate_revoke_or_list_access(self):
+        self.bridge.viewers["222222"] = {"since": 1, "generation": "a" * 24, "label": "@Friend"}
+        self.bridge.routes["10"] = "123-1"
+        self.bridge.call = AsyncMock(return_value={"message_id": 1})
+        for text in ["/addviewer 333333", "/removeviewer 222222", "/viewers", "/rooms", "/say 123-1 hi", "hi"]:
+            message = self.message(text, 10)
+            message["from"]["id"] = message["chat"]["id"] = 222222
+            await self.bridge.handle_message(message)
+        self.first.say.assert_not_awaited()
+        self.second.say.assert_not_awaited()
+        self.assertEqual(list(self.bridge.viewers), ["222222"])
+        self.bridge.notify.assert_not_awaited()
+        self.assertTrue(all(c.kwargs["chat_id"] == 222222 for c in self.bridge.call.await_args_list))
+
+    async def test_unapproved_start_only_returns_id_and_requests_owner_approval_once(self):
+        self.bridge.call = AsyncMock(return_value={"message_id": 1})
+        msg = self.message("/start")
+        msg["from"] = {"id": 222222, "username": "Friend"}
+        msg["chat"]["id"] = 222222
+        await self.bridge.handle_message(msg)
+        await self.bridge.handle_message(msg)
+        self.assertFalse(self.bridge.viewers)
+        self.bridge.notify.assert_awaited_once()
+        self.assertIn("/addviewer 222222", self.bridge.notify.await_args.args[0])
+        self.assertIn("No room logs", self.bridge.call.await_args.kwargs["text"])
+
+    async def test_viewers_receive_only_logs_after_grant_without_owner_reply_routes(self):
+        self.bridge.viewers["222222"] = {"since": 2, "generation": "a" * 24, "label": "@Friend"}
+        delivered = asyncio.Event()
+        async def call(method, **kwargs):
+            self.assertEqual(kwargs["chat_id"], 222222)
+            self.assertIn("new log", kwargs["text"])
+            self.assertNotIn("old log", kwargs["text"])
+            delivered.set()
+            return {"message_id": 99}
+        self.bridge.call = AsyncMock(side_effect=call)
+        self.bridge.fanout("123-1", [(1, "old log"), (2, "new log")])
+        try:
+            await asyncio.wait_for(delivered.wait(), 2)
+            self.assertFalse(self.bridge.routes)
+        finally:
+            await self.bridge.close()
+
+    async def test_revoke_waits_for_inflight_send_then_clears_queue_and_stays_revoked(self):
+        self.bridge.viewers["222222"] = {"since": 1, "generation": "a" * 24, "label": "@Friend"}
+        started, release = asyncio.Event(), asyncio.Event()
+        async def call(method, **kwargs):
+            started.set()
+            await release.wait()
+            return {"message_id": 1}
+        self.bridge.call = AsyncMock(side_effect=call)
+        self.bridge.fanout("123-1", [(1, "first log")])
+        await asyncio.wait_for(started.wait(), 2)
+        self.bridge.fanout("123-1", [(2, "queued log")])
+        remove = asyncio.create_task(self.bridge.handle_message(self.message("/removeviewer 222222")))
+        await asyncio.sleep(.03)
+        self.assertFalse(remove.done())
+        release.set()
+        await asyncio.wait_for(remove, 2)
+        self.assertNotIn("222222", self.bridge.viewers)
+        self.assertNotIn("222222", self.bridge.viewer_queues)
+        self.bridge.fanout("123-1", [(3, "after removal")])
+        await asyncio.sleep(.03)
+        self.bridge.call.assert_awaited_once()
+        restarted = TelegramBridge(self.manager)
+        with patch.object(restarted, "run", AsyncMock()):
+            await restarted.start()
+            await restarted.close()
+        self.assertFalse(restarted.viewers)
+
+    async def test_viewer_permission_save_failures_roll_back(self):
+        self.bridge.call = AsyncMock(return_value={"id": 222222, "type": "private", "username": "Friend"})
+        with patch.object(self.bridge.store, "save", side_effect=OSError("unavailable")):
+            await self.bridge.handle_message(self.message("/addviewer 222222"))
+        self.assertFalse(self.bridge.viewers)
+        original = {"since": 1, "generation": "a" * 24, "label": "@Friend"}
+        self.bridge.viewers["222222"] = original
+        with patch.object(self.bridge.store, "save", side_effect=OSError("unavailable")):
+            await self.bridge.handle_message(self.message("/removeviewer 222222"))
+        self.assertEqual(self.bridge.viewers["222222"], original)
+
+    async def test_invalid_ids_group_destinations_and_owner_removal_rejected(self):
+        self.bridge.call = AsyncMock(return_value={"id": 222222, "type": "group"})
+        for text in ["/addviewer -222222", "/addviewer @Friend", "/addviewer 222222", "/removeviewer 111111"]:
+            await self.bridge.handle_message(self.message(text))
+        self.assertFalse(self.bridge.viewers)
+        self.assertIn("permanent", self.bridge.notify.await_args.args[0])

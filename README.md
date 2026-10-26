@@ -285,9 +285,32 @@ are included. Messages from one room may be batched into one Telegram message.
 - `/say ROOM_ID message` sends to an explicitly chosen room.
 - `/help` explains the commands.
 
+Only the owner can manage read-only Telegram viewers, in their private bot chat:
+
+```text
+/addviewer TELEGRAM_ID
+/removeviewer TELEGRAM_ID
+/viewers
+```
+
+Ask the friend to open `@RamseiIMVUbot` and press Start. The bot gives them their
+numeric Telegram ID and sends the owner an approval request. Starting the bot
+alone grants no access. `/addviewer ID` approves live logs from **all connected
+rooms**, starting with messages received after approval. Up to 10 viewers can be
+approved. Display names/usernames are labels only; numeric IDs authorize access.
+Viewers cannot send IMVU replies, list/control rooms or manage access. They can
+use `/start`, `/help` or `/id` to check their own read-only status and account ID.
+
+Viewer grants and removals survive restarts. Removal waits for any already-started
+delivery to finish before confirming, then cancels that viewer's queued deliveries
+and stops future logs. Previously delivered Telegram messages remain with them.
+Viewer streams are independent, live/best-effort feeds with up to 100 queued batches
+each; slow/offline viewers never block the owner. Viewer queues are not replayed
+after restart. Remove and re-add starts a fresh authorization, without old backlog.
+
 Replies appear in IMVU as normal RAMSEI messages, without a Telegram prefix. There is
 no implicit default room. Only messages from the pinned owner in that owner's
-private chat are accepted; group chats and other senders cannot control the bot.
+private chat can send IMVU replies; group chats and viewers cannot control the bot.
 Replies are plain text, up to 430 characters. Avatar/system actions are rejected.
 Telegram does not gain IMVU permission-management or room-control commands.
 
