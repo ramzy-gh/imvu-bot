@@ -178,6 +178,10 @@ seat on the caller's current room shell or furniture item. It never moves anothe
 user or guesses seat numbers. If that item has no free seat, it reports that.
 Animated furniture may differ from its base skeleton positions. Requests have a
 10-second cooldown per room. IMVU must confirm the new seat before success is reported.
+The bot also broadcasts IMVU's server-provided Classic seat announcement after
+moving, on arrival, for new visitors and periodically, matching the web client's
+legacy compatibility behavior. A server seat update alone does not prove that
+Classic rendered the move; visual confirmation is still needed.
 
 Welcomes are checked every five seconds and tracked separately in each room. New arrivals receive an English
 welcome using their account username. Membership refreshes triggered by chat also

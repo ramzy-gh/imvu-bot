@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from movement import API, Movement, asset_url, participant_seats, skeleton_seats
+from movement import API, Movement, asset_url, participant_seats, skeleton_seats, legacy_seat_message
 
 
 def bone(name, xyz, parent=-1, q=(0, 0, 0, 1)):
@@ -14,7 +14,8 @@ def bone(name, xyz, parent=-1, q=(0, 0, 0, 1)):
 
 def seats(room, entries):
     return {"denormalized": {API + f"/chat/chat-{room}/participants/user-{uid}":
-            {"data": {"seat_furni_id": fid, "seat_number": seat}} for uid, fid, seat in entries}}
+            {"data": {"seat_furni_id": fid, "seat_number": seat,
+                      "legacy_seat_message": f"*msg SeatAssignment 3 {uid} {seat} {fid}"}} for uid, fid, seat in entries}}
 
 
 class MovementTests(unittest.IsolatedAsyncioTestCase):
@@ -23,6 +24,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.bot = SimpleNamespace(room=self.room, user_id="9", connected=True, chat_ready=True,
                                    members={"1", "9"}, permissions=SimpleNamespace(allowed=lambda uid: True))
         self.mover = Movement(self.bot)
+        self.bot.say = AsyncMock(return_value=True)
         self.positions = {30: (0, 0, 0), 31: (100, 0, 0), 8: (1, 0, 0), 7: (2, 0, 0)}
         self.mover.seat_map = AsyncMock(return_value=self.positions)
 
@@ -33,6 +35,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         self.bot.api.assert_any_await("POST", "/chat/chat-123-1/participants/user-9",
                                        json={"seat_furni_id": 0, "seat_number": 7})
         self.assertEqual(len([c for c in self.bot.api.await_args_list if c.args[0] == "POST"]), 1)
+        self.bot.say.assert_awaited_once_with("*msg SeatAssignment 3 9 7 0")
         self.assertIn("moment", await self.mover.move_near("1"))
 
     async def test_target_moves_during_asset_loading(self):
@@ -82,3 +85,11 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
                     "https://asset-server-akm.imvu.com/private", "//127.0.0.1/asset/test"]:
             with self.assertRaises(ValueError):
                 asset_url(url)
+
+    def test_classic_message_cannot_move_another_avatar(self):
+        snapshot = seats(self.room, [("9", 0, 7)])
+        self.assertEqual(legacy_seat_message(snapshot, self.room, "9"), "*msg SeatAssignment 3 9 7 0")
+        node = snapshot["denormalized"][API + "/chat/chat-123-1/participants/user-9"]
+        node["data"]["legacy_seat_message"] = "*msg SeatAssignment 3 1 7 0"
+        with self.assertRaises(ValueError):
+            legacy_seat_message(snapshot, self.room, "9")

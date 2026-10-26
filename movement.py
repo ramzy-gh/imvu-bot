@@ -100,6 +100,19 @@ def participant_seats(data, room):
     return found
 
 
+def legacy_seat_message(data, room, uid):
+    """Use IMVU's own Classic message, strictly bound to this avatar and seat."""
+    address = participant_seats(data, room).get(uid)
+    node = data.get("denormalized", {}).get(API + f"/chat/chat-{room}/participants/user-{uid}", {})
+    message = node.get("data", {}).get("legacy_seat_message")
+    if address is None or not isinstance(message, str):
+        raise ValueError("IMVU did not provide a Classic seat announcement.")
+    fid, seat = address
+    if not re.fullmatch(r"\*msg SeatAssignment \d+ " + re.escape(uid) + " " + str(seat) + " " + fid, message):
+        raise ValueError("IMVU returned an inconsistent Classic seat announcement.")
+    return message
+
+
 class Movement:
     def __init__(self, bot):
         self.bot = bot
@@ -194,8 +207,13 @@ class Movement:
             chosen = candidates[0]
             own_path = path + f"/user-{bot.user_id}"
             await bot.api("POST", own_path, json={"seat_furni_id": int(fid), "seat_number": chosen})
-            actual = participant_seats(await bot.api("GET", own_path), bot.room).get(bot.user_id)
+            confirmation = await bot.api("GET", own_path)
+            actual = participant_seats(confirmation, bot.room).get(bot.user_id)
             if actual != (fid, chosen):
                 return "IMVU didn't confirm my new spot. Please try !move again."
-            self.last_move = time.monotonic()
+            # The official client broadcasts this after a REST seat change.
+            # Classic clients do not reliably render a REST-only update.
+            if not await bot.say(legacy_seat_message(confirmation, bot.room, bot.user_id)):
+                return "My seat changed, but the room announcement failed. Please try !move again."
+            self.last_move = bot.last_seat_announcement = time.monotonic()
             return "Moved to a free spot near you!"

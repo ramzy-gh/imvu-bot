@@ -20,7 +20,7 @@ from permissions import Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normali
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
 from wardrobe import load_named_outfit, OutfitError
-from movement import Movement
+from movement import Movement, legacy_seat_message
 
 LOG = logging.getLogger("ramsei")
 API = "https://api.imvu.com"
@@ -418,6 +418,7 @@ class Bot:
         self.members_initialized = False
         self.welcome_lock = asyncio.Lock()
         self.movement = Movement(self)
+        self.last_seat_announcement = -1000
         self.cooldowns = {}
         self.song_choices = OrderedDict()
         self.commands = asyncio.Queue(maxsize=50)
@@ -605,6 +606,9 @@ class Bot:
         async with self.welcome_lock:
             if not self.connected or not self.chat_ready:
                 return
+            if self.pending_welcomes:
+                with contextlib.suppress(RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
+                    await self.announce_seat()
             for uid in list(self.pending_welcomes):
                 if uid not in self.members or uid == self.user_id or not self.permissions.allowed(uid):
                     self.pending_welcomes.pop(uid, None)
@@ -634,6 +638,13 @@ class Bot:
                     # or preventing other arrivals from being welcomed.
                     LOG.warning("Welcome deferred in room %s; will retry.", self.room)
 
+    async def announce_seat(self):
+        if not self.connected or not self.chat_ready or time.monotonic() - self.last_seat_announcement < 5:
+            return
+        data = await self.api("GET", f"/chat/chat-{self.room}/participants/user-{self.user_id}")
+        if await self.say(legacy_seat_message(data, self.room, self.user_id)):
+            self.last_seat_announcement = time.monotonic()
+
     async def update_account_presence(self):
         try:
             data = await self.api("POST", f"/presence/presence-{self.user_id}", json={"online": True})
@@ -657,6 +668,9 @@ class Bot:
                 last_keepalive = now
             if now - self.last_account_presence >= 45:
                 await self.update_account_presence()
+            if now - self.last_seat_announcement >= 60:
+                with contextlib.suppress(RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
+                    await self.announce_seat()
             await self.participants(greet=True)
 
     async def announce_appearance(self):
@@ -672,6 +686,7 @@ class Bot:
             # No room/global settings, seats, or other avatars are modified.
             await self.say("*putOnOutfit " + ids)
             await self.say("*use " + ids)
+            await self.announce_seat()
             self.last_appearance = time.monotonic()
             self.appearance = {"state": "announced_not_render_verified", "product_count": len(self.outfit_products),
                                  "source": "named_saved_outfit", "name": self.outfit_name}
