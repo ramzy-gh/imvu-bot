@@ -198,7 +198,7 @@ class Radio:
             raise ValueError("Search using a song or artist name.")
         data = json.loads(await capture(sys.executable, "-m", "yt_dlp", "--no-warnings",
             "--flat-playlist", "--skip-download", "--dump-single-json",
-            "--socket-timeout", "15", "--retries", "1", "--", "ytsearch5:" + query))
+            "--socket-timeout", "15", "--retries", "1", "--", "ytsearch10:" + query))
         choices, seen = [], set()
         for item in data.get("entries", []) or []:
             if not isinstance(item, dict):
@@ -213,7 +213,7 @@ class Radio:
             seen.add(video_id)
             choices.append({"title": " ".join(str(item.get("title") or "Unknown track").split())[:140],
                             "url": "https://www.youtube.com/watch?v=" + video_id})
-            if len(choices) == 5:
+            if len(choices) == 10:
                 break
         if not choices:
             raise ValueError("No song choices found. Try a more specific song name.")
@@ -482,6 +482,7 @@ class Bot:
     def __init__(self, radio, room=None, permissions=None, authentication=None, room_manager=None):
         self.radio = radio
         self.room = room or os.getenv("IMVU_ROOM_ID", "330286535-177")
+        self.room_name = self.room
         self.authentication = authentication
         self.room_manager = room_manager
         if not re.fullmatch(r"\d+-\d+", self.room):
@@ -526,7 +527,7 @@ class Bot:
         self.say_lock = asyncio.Lock()
         from room_language import RoomSpeech
         self.speech = RoomSpeech(self.room_language)
-        self.social = Social(self.say, allowed=self.permissions.allowed, language_policy=self.room_language)
+        self.social = Social(self.say, allowed=self.permissions.allowed, language_policy=self.room_language, chat_say=self.say_chat)
 
     async def api(self, method, path, **kwargs):
         async with self.session.request(method, API + path, **kwargs) as response:
@@ -642,16 +643,17 @@ class Bot:
         return self.op
 
     def room_language(self):
-        return self.room_manager.room_languages.get(self.room, "auto") if self.room_manager else "auto"
+        manager = getattr(self, "room_manager", None)
+        return getattr(manager, "room_languages", {}).get(self.room, "auto")
+
+    async def say_chat(self, text):
+        rendered = await self.speech.render(text)
+        return await self.say(rendered) if rendered else False
 
     async def say(self, text):
         if not self.connected:
             return False
         async with self.say_lock:
-            if hasattr(self, "speech"):
-                text = await self.speech.render(text)
-                if not text:
-                    return False
             await asyncio.sleep(max(0, self.last_said + 1.5 - time.monotonic()))
             if not self.connected:
                 return False
@@ -668,6 +670,19 @@ class Bot:
             if bridge:
                 bridge.record(self.room, self.user_id, text, os.getenv("IMVU_USERNAME", "Ramsei"))
             return True
+
+    async def load_room_name(self, data=None):
+        room_url = API + f"/room/room-{self.room}"
+        try:
+            info = (data or {}).get("denormalized", {}).get(room_url, {}).get("data", {})
+            if not info.get("name"):
+                result = await asyncio.wait_for(self.api("GET", f"/room/room-{self.room}"), 8)
+                info = result.get("denormalized", {}).get(room_url, {}).get("data", {})
+            name = info.get("name")
+            if isinstance(name, str) and name.strip():
+                self.room_name = name.strip()[:100]
+        except (RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
+            LOG.warning("Room title lookup deferred in %s", self.room)
 
     async def participants(self, greet=False):
         path = f"/chat/chat-{self.room}/participants"
@@ -715,7 +730,14 @@ class Bot:
                     if uid not in self.members or not self.permissions.allowed(uid):
                         self.pending_welcomes.pop(uid, None)
                         continue
-                    sent = await self.say(f"Welcome, @{name}! Great to have you here! Music: !play <song or artist> | Games: !game")
+                    room_name = getattr(self, "room_name", self.room)
+                    if self.room_language().startswith("ar"):
+                        greeting = f"نورت روم {room_name} يا @{name}! للمزيكا !play وللعب !game."
+                    elif self.room_language().startswith("ru"):
+                        greeting = f"Добро пожаловать, @{name}, в комнату {room_name}! Музыка: !play | Игры: !game"
+                    else:
+                        greeting = f"Welcome, @{name}, to {room_name}! Music: !play <song or artist> | Games: !game"
+                    sent = await self.say(greeting)
                     if not sent:
                         continue
                     self.pending_welcomes.pop(uid, None)
@@ -973,7 +995,15 @@ class Bot:
         lines = [f'Song choices for "{title}":']
         lines.extend(f'{number}. {choice["title"][:52]}' for number, choice in enumerate(choices, 1))
         lines.append(f"Requester: reply 1-{len(choices)} within 2 minutes.")
-        await self.say("\n".join(lines))
+        chunk = lines[0]
+        for line in lines[1:]:
+            if len(chunk) + len(line) + 1 > 420:
+                await self.say(chunk)
+                chunk = line
+            else:
+                chunk += "\n" + line
+        if chunk:
+            await self.say(chunk)
 
     async def command_worker(self):
         while True:
@@ -1037,7 +1067,7 @@ class Bot:
                     await self.say("Next: " + " | ".join(titles) if titles else "The queue is empty.")
                 else:
                     await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | !move: come near you | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
-                    await self.say("Music search: !play <song or artist>, then reply 1-5 to choose. A YouTube link queues directly.")
+                    await self.say("Music search: !play <song or artist>, then reply 1-10 to choose. A YouTube link queues directly.")
                     if self.permissions.authorization_error(uid, verified, "!rooms") is None:
                         await self.say("Room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
                     if self.permissions.authorization_error(uid, verified, "!addroomadmin") is None:
@@ -1061,6 +1091,7 @@ class Bot:
                     await self.api("POST", f"/chat/chat-{self.room}/participants", json={})
                     data = await self.api("GET", f"/chat/chat-{self.room}")
                     info = data.get("denormalized", {}).get(API + f"/chat/chat-{self.room}", {}).get("data", {})
+                    await self.load_room_name(data)
                     self.queue = info.get("imq_queue")
                     if not self.queue:
                         raise RuntimeError("IMVU did not return a room queue.")
