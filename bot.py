@@ -1000,7 +1000,10 @@ class Bot:
                 elif cmd == "!radio":
                     base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
                     path = f"/rooms/{self.room}/stream.mp3"
-                    await self.say("Host/mod: load " + (base + path if base else "your HTTPS host domain + " + path) + " in IMVU Radio, then press Play. Listeners: " + str(len(self.radio.listeners)))
+                    await self.say("Radio for this room (" + self.room + "): " +
+                        (base + path if base else "your HTTPS host domain + " + path) +
+                        "\nHost/mod: load this link in this room's IMVU Radio and press Play. " +
+                        "Music and queue are separate for each room. Listeners: " + str(len(self.radio.listeners)))
                 elif cmd == "!play":
                     await self.play_request(uid, query.strip())
                 elif cmd == "!move":

@@ -50,6 +50,22 @@ class Controls(unittest.IsolatedAsyncioTestCase):
             a.radio.queue.put_nowait({"title": "Only A"})
             self.assertTrue(b.radio.queue.empty())
             self.assertIsNot(a.social, b.social)
+            with patch.dict(os.environ, {"PUBLIC_BASE_URL": "https://radio.example"}):
+                workers = []
+                for bot in (a, b):
+                    bot.say = AsyncMock(return_value=True)
+                    bot.commands.put_nowait((OWNER_ID, "!radio", True))
+                    workers.append(asyncio.create_task(bot.command_worker()))
+                try:
+                    await asyncio.wait_for(asyncio.gather(a.commands.join(), b.commands.join()), 2)
+                    for bot, other in ((a, b), (b, a)):
+                        reply = bot.say.await_args.args[0]
+                        self.assertIn(f"https://radio.example/rooms/{bot.room}/stream.mp3", reply)
+                        self.assertNotIn(f"/rooms/{other.room}/", reply)
+                finally:
+                    for worker in workers:
+                        worker.cancel()
+                    await asyncio.gather(*workers, return_exceptions=True)
             await asyncio.sleep(0)
             await manager.command("leave 123-1")
             self.assertTrue(ta.done())

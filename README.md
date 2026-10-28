@@ -17,9 +17,13 @@ on the server; people can use Classic to chat in the room.
 
 - Egyptian Arabic welcomes, with visitor names and emojis.
 - Mention **Ramsei**, **رامسي**, **رامزي**, or **رامزى** for a reply.
-- Real AI chat when `GEMINI_API_KEY` is configured; clearly limited canned replies otherwise.
+- Real AI chat through Groq (`AI_PROVIDER=groq`, `GROQ_API_KEY`) or Gemini
+  (`AI_PROVIDER=gemini`, `GEMINI_API_KEY`); limited scripted replies otherwise.
+- AI personality: sharp Egyptian banter, dry sarcasm and playful roasts, with
+  English replies to English speakers and Egyptian Arabic replies to Arabic speakers.
+  Serious questions get useful answers; asking it to stop ends the roasting.
 - Only addressed messages and up to three recent exchanges with that participant
-  are sent to Google when AI is enabled. Ordinary room chat is not sent.
+  are sent to the selected AI provider. Ordinary room chat is not sent to the AI.
 - Riddles, trivia, number guessing, jokes, light challenges, playful fortunes.
 - Games and scores are held in memory and reset on restart.
 - Arabic and English music search; first YouTube search match, queue, MP3 radio.
@@ -73,13 +77,18 @@ Example messages:
 | `SESSION_PATH` | `/app/data/ramsei/imvu-session.json` |
 | `PERMISSIONS_PATH` | `/app/data/ramsei/permissions.json` |
 | `ADMIN_IDS` | Leave empty; optional first-start admin seed only |
+| `AI_PROVIDER` | `groq` (default), or `gemini` |
+| `GROQ_API_KEY` | Your private Groq API key when using Groq |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` by default |
 | `GEMINI_API_KEY` | Optional: your private Google AI Studio API key |
 | `GEMINI_MODEL` | `gemini-flash-latest`, or an available text model for your key |
 | `AI_MAX_CALLS_PER_HOUR` | `60` |
 
-Create an optional AI key at https://aistudio.google.com/apikey . Account eligibility,
-model availability, quotas and any charges are controlled by Google. The bot
-does not create a key or enable billing for you.
+Create an optional AI key at https://console.groq.com/keys (Groq) or
+https://aistudio.google.com/apikey (Gemini). Account eligibility, model availability,
+quotas and charges are controlled by the selected provider. Groq offers a free
+plan with limits; changing the personality does not require changing plans.
+The bot does not create a key or enable billing for you.
 
 ## RAMSEI has 2FA — keep it enabled
 
@@ -151,8 +160,11 @@ Each room has its own queue and stream:
 `https://YOUR-BOTHOST-DOMAIN/rooms/330286535-177/stream.mp3`.
 `/stream.mp3` remains an alias for the `IMVU_ROOM_ID` room.
 
-After the server works, the room owner/moderator opens **Radio** in Classic,
-loads `https://YOUR-BOTHOST-DOMAIN/stream.mp3`, then clicks Play.
+After the server works, type `!radio` inside each room. That reply labels the
+current room ID and gives its own full URL. The room owner/moderator opens
+**Radio** in Classic, loads that room's `/rooms/ROOM-ID/stream.mp3` link, then clicks Play.
+Do not reuse the main room's link in other rooms: their radios would then play
+the main room's music. Each room has an independent queue, encoder and listeners.
 Use the real domain from your Bothost panel; the example is a placeholder.
 
 The stream emits silence when no track is queued so listeners can remain connected.
