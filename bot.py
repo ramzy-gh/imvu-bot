@@ -31,6 +31,12 @@ class AuthenticationRequired(RuntimeError):
     pass
 
 
+class IMVURequestError(RuntimeError):
+    def __init__(self, status, path):
+        self.status = status
+        super().__init__(f"IMVU request failed: HTTP {status} at {path.split('?')[0]}")
+
+
 class LoginPaused(RuntimeError):
     def __init__(self, status, message):
         super().__init__(message)
@@ -169,6 +175,7 @@ class Radio:
         self.track_starts = 0
         self.recent_frames = deque(maxlen=10)  # About 260 ms for decoder startup.
         self.listener_resyncs = 0
+        self.source_retries = 0
 
     @staticmethod
     def lookup_target(query):
@@ -227,7 +234,8 @@ class Radio:
         if not data["url"].startswith("https://"):
             raise ValueError("This result has no supported secure audio source.")
         return {"title": str(data.get("title", "Unknown track"))[:140],
-                "url": data["url"], "duration": data["duration"]}
+                "url": data["url"], "duration": data["duration"],
+                "source": data.get("webpage_url") or target}
 
     def interrupt(self):
         self.skip.set()
@@ -276,7 +284,10 @@ class Radio:
     def decoder_args(self, track):
         return [os.getenv("FFMPEG_BINARY", "ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-protocol_whitelist", "https,tls,tcp,crypto", "-rw_timeout", "15000000",
-                "-i", track["url"], "-t", "900", "-vn", "-ac", "2", "-ar", "44100",
+                "-reconnect", "1", "-reconnect_on_network_error", "1",
+                "-reconnect_on_http_error", "429,5xx", "-reconnect_delay_max", "5",
+                "-ss", str(track.get("offset", 0)), "-i", track["url"],
+                "-t", str(max(0.1, 900 - track.get("offset", 0))), "-vn", "-ac", "2", "-ar", "44100",
                 "-f", "s16le", "pipe:1"]
 
     @staticmethod
@@ -301,19 +312,46 @@ class Radio:
             self.current = track
             self.idle = False
             self.skip.clear()
-            read_task = stop_task = None
+            stop_task = None
             try:
-                self.proc = await asyncio.create_subprocess_exec(*self.decoder_args(track), stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL)
                 self.track_starts += 1
                 stop_task = asyncio.create_task(self.skip.wait())
                 with contextlib.suppress(ConnectionError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
                     await announce("Now playing: " + track["title"])
+                await self.decode_track(track, stop_task)
+            except (OSError, ValueError):
+                self.last_error = "Audio decoder could not start; check FFmpeg and the song source."
+                LOG.warning(self.last_error)
+            finally:
+                if stop_task:
+                    stop_task.cancel()
+                    await asyncio.gather(stop_task, return_exceptions=True)
+                await self.stop_process(self.proc)
+                self.proc = None
+                self.current = None
+                self.idle = True
+                self.queue.task_done()
+
+    async def decode_track(self, track, stop_task):
+        """Resume truncated sources at the number of PCM samples already queued."""
+        decoded_bytes = 0
+        self.last_error = None
+        for attempt in range(4):
+            if self.skip.is_set():
+                return
+            source = dict(track, offset=decoded_bytes / 176400)
+            read_task = None
+            try:
+                self.proc = await asyncio.create_subprocess_exec(*self.decoder_args(source),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
                 while not self.skip.is_set():
                     read_task = asyncio.create_task(self.proc.stdout.readexactly(17640))
-                    await asyncio.wait({read_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                    done, _ = await asyncio.wait({read_task, stop_task}, timeout=45,
+                                                 return_when=asyncio.FIRST_COMPLETED)
                     if self.skip.is_set():
-                        break
+                        return
+                    if read_task not in done:
+                        break  # Bounded stall recovery; keep the radio connection alive.
                     ended = False
                     try:
                         chunk = read_task.result()
@@ -321,23 +359,49 @@ class Radio:
                         chunk, ended = error.partial, True
                     if chunk:
                         await self.pcm.put(chunk.ljust(17640, b"\0"))
+                        decoded_bytes += len(chunk)
                     if ended:
                         await self.proc.wait()
-                        self.last_error = "Audio source failed; try another song or update yt-dlp." if self.proc.returncode else None
                         break
-            except (OSError, ValueError):
-                self.last_error = "Audio decoder could not start; check FFmpeg and the song source."
-                LOG.warning(self.last_error)
             finally:
-                for task in (read_task, stop_task):
-                    if task:
-                        task.cancel()
-                await asyncio.gather(*(t for t in (read_task, stop_task) if t), return_exceptions=True)
+                if read_task:
+                    read_task.cancel()
+                    await asyncio.gather(read_task, return_exceptions=True)
+                returncode = self.proc.returncode if self.proc else None
                 await self.stop_process(self.proc)
                 self.proc = None
-                self.current = None
-                self.idle = True
-                self.queue.task_done()
+            if self.skip.is_set():
+                return
+            position = decoded_bytes / 176400
+            duration = min(float(track.get("duration", 900)), 900)
+            # Extractor durations can round down by a second. Clean EOF near the
+            # expected end is normal; clean EOF far before it is truncation too.
+            if (position > 0 and returncode == 0 and position >= duration - 1) or position >= duration or (returncode == 0 and "duration" not in track):
+                return
+            if attempt == 3:
+                self.last_error = "Song source ended early after three resume attempts."
+                LOG.warning("Audio source incomplete: decoded=%.1fs expected=%.1fs", position, duration)
+                return
+            self.source_retries += 1
+            LOG.warning("Resuming interrupted audio source at %.1fs (attempt %s)", position, attempt + 1)
+            # Fresh URLs also recover tracks whose signed link expired in queue.
+            if track.get("source"):
+                refresh = asyncio.create_task(self.lookup(track["source"]))
+                try:
+                    done, _ = await asyncio.wait({refresh, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                    if self.skip.is_set():
+                        return
+                    track = dict(track, url=refresh.result()["url"])
+                except (RuntimeError, ValueError, OSError, asyncio.TimeoutError):
+                    pass  # The original URL may still recover on the next attempt.
+                finally:
+                    refresh.cancel()
+                    await asyncio.gather(refresh, return_exceptions=True)
+            try:
+                await asyncio.wait_for(self.skip.wait(), 1)
+                return
+            except asyncio.TimeoutError:
+                pass
 
     async def run(self, announce):
         """One continuous MP3 encoder per room, across all tracks and idle silence."""
@@ -441,6 +505,7 @@ class Bot:
         self.appearance = {"state": "not_announced", "product_count": 0}
         self.outfit_products = []
         self.last_appearance = 0
+        self.appearance_pending = False
         self.outfit_loaded_at = 0
         self.next_outfit_attempt = 0
         self.outfit_name = os.getenv("IMVU_OUTFIT_NAME", "Bot").strip() or "Bot"
@@ -455,7 +520,7 @@ class Bot:
             if response.status == 401:
                 raise AuthenticationRequired("IMVU session expired; a fresh password login is required.")
             if response.status not in (200, 201, 204):
-                raise RuntimeError(f"IMVU request failed: HTTP {response.status} at {path.split('?')[0]}")
+                raise IMVURequestError(response.status, path)
             return await response.json() if response.status != 204 else {}
 
     def session_path(self):
@@ -590,6 +655,8 @@ class Bot:
         new = participant_ids(data, API + path)
         self.last_membership_refresh = time.monotonic()
         if self.members_initialized:
+            if new - self.members - {self.user_id}:
+                self.appearance_pending = True
             for uid in sorted(new - self.members - {self.user_id}):
                 self.pending_welcomes[uid] = time.monotonic()
         self.members_initialized = True
@@ -667,14 +734,28 @@ class Bot:
             now = time.monotonic()
             if now - last_keepalive >= 15:
                 await self.packet("msg_c2g_ping")
-                await self.api("POST", f"/chat/chat-{self.room}/participants/user-{self.user_id}", json={})
-                last_keepalive = now
+                if await self.room_maintenance(self.api("POST", f"/chat/chat-{self.room}/participants/user-{self.user_id}", json={})):
+                    last_keepalive = now
             if now - self.last_account_presence >= 45:
                 await self.update_account_presence()
-            if now - self.last_seat_announcement >= 60:
-                with contextlib.suppress(RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
-                    await self.announce_seat()
-            await self.participants(greet=True)
+            # Seat announcements are for arrival/movement. Re-sending an
+            # unchanged seat on a timer can make Classic rebuild the avatar.
+            await self.room_maintenance(self.participants(greet=True))
+            if self.appearance_pending:
+                await self.announce_appearance()
+
+    async def room_maintenance(self, operation):
+        """An API hiccup must not tear down a healthy IMQ socket and reload the avatar."""
+        try:
+            await operation
+            return True
+        except IMVURequestError as error:
+            if error.status not in (408, 429) and error.status < 500:
+                raise  # Missing membership or denied access needs real recovery.
+        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
+            pass
+        LOG.warning("Room maintenance deferred in %s; keeping the chat connection", self.room)
+        return False
 
     async def announce_appearance(self):
         if time.monotonic() - self.last_appearance < 10 or time.monotonic() < self.next_outfit_attempt:
@@ -687,14 +768,16 @@ class Bot:
             ids = " ".join(self.outfit_products)
             # Announce only the named outfit from this account's own wardrobe.
             # No room/global settings, seats, or other avatars are modified.
-            await self.say("*putOnOutfit " + ids)
-            await self.say("*use " + ids)
+            if not await self.say("*putOnOutfit " + ids):
+                return
             await self.announce_seat()
             self.last_appearance = time.monotonic()
+            self.appearance_pending = False
             self.appearance = {"state": "announced_not_render_verified", "product_count": len(self.outfit_products),
                                  "source": "named_saved_outfit", "name": self.outfit_name}
             LOG.info("Named saved outfit selected and announced: %s products; client rendering requires visual verification", len(self.outfit_products))
         except (RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as error:
+            self.appearance_pending = True
             self.next_outfit_attempt = time.monotonic() + 60
             reason = str(error) if isinstance(error, OutfitError) else type(error).__name__
             self.appearance = {"state": "announcement_failed", "product_count": 0,
@@ -747,7 +830,7 @@ class Bot:
             command = decode_message(packet, self.queue, self.members, self.user_id)
             if command is None and rejection_reason(packet, self.queue, self.members, self.user_id) == "sender_missing_from_participants":
                 if time.monotonic() - self.last_membership_refresh >= 5:
-                    await self.participants()
+                    await self.room_maintenance(self.participants())
                     command = decode_message(packet, self.queue, self.members, self.user_id)
             if command is None and packet.get("record") == "msg_g2c_send_message":
                 reason = rejection_reason(packet, self.queue, self.members, self.user_id)

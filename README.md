@@ -378,6 +378,20 @@ The bot refreshes its own account presence at room connection and about every
 `account_presence`. This keeps the online indicator updated while the bot can
 reach IMVU; outages, shutdowns and IMVU account restrictions can still make it offline.
 
+Temporary room API timeouts, rate limits and server errors retry without closing
+the chat socket. This avoids unnecessary reconnects and avatar outfit reloads.
+Outfits use one `*putOnOutfit` announcement, with a cached repeat when a new
+visitor joins so their client also receives RAMSEI's saved outfit. Updates are
+limited to once per ten seconds; idle rooms do not repeatedly reload the outfit.
+Unchanged seats are no longer broadcast every minute; arrival and `!move` still
+announce the seat normally.
+
+Interrupted song sources reconnect and, if they still end early, resume up to
+three times from the decoded sample position, refreshing the YouTube media URL.
+The MP3 encoder and listeners stay connected during recovery. `/health` includes
+`source_retries`; `audio_error` reports when recovery is exhausted. A permanently
+unavailable source can still fail, and IMVU rendering needs checking in the client.
+
 Set `IMVU_ROOM_IDS=330286535-177,OTHEROWNER-OTHERROOM` using real numeric room IDs
 to request multiple rooms at startup. Omit it to use only `IMVU_ROOM_ID`.
 There is a local limit of 10 rooms. Authentication is reused; each room gets

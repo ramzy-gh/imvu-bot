@@ -27,8 +27,10 @@ class WelcomeTests(unittest.IsolatedAsyncioTestCase):
     async def test_receive_membership_refresh_does_not_steal_welcome(self):
         bot = self.bot()
         await bot.participants()
+        self.assertFalse(bot.appearance_pending)
         bot.occupants.add("1")
         await bot.participants(greet=False)
+        self.assertTrue(bot.appearance_pending)
         await bot.participants(greet=True)
         await bot.participants(greet=True)
         bot.say.assert_awaited_once()
