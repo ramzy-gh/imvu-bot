@@ -119,15 +119,15 @@ class SearchResults(unittest.IsolatedAsyncioTestCase):
         entries = [None, {"id": "bad"}, {"id": "abcdefghij0", "duration": 901},
                    {"id": "abcdefghij0", "is_live": True},
                    {"id": "abcdefghij0", "live_status": "is_upcoming"}]
-        entries += [{"id": f"abcdefghij{n}", "title": "Song\n" + str(n), "duration": 180} for n in range(7)]
+        entries += [{"id": f"abcde{n:06d}", "title": "Song\n" + str(n), "duration": 180} for n in range(12)]
         entries.insert(7, entries[6])  # Duplicate does not consume a choice.
         with patch("bot.capture", AsyncMock(return_value=json.dumps({"entries": entries}))) as capture:
             results = await Radio().search("billie eilish")
-        self.assertEqual(len(results), 5)
+        self.assertEqual(len(results), 10)
         self.assertEqual(results[0]["title"], "Song 0")
         self.assertTrue(all(r["url"].startswith("https://www.youtube.com/watch?v=") for r in results))
         self.assertIn("--flat-playlist", capture.await_args.args)
-        self.assertEqual(capture.await_args.args[-1], "ytsearch5:billie eilish")
+        self.assertEqual(capture.await_args.args[-1], "ytsearch10:billie eilish")
 
     async def test_empty_results_and_unsupported_urls(self):
         with patch("bot.capture", AsyncMock(return_value='{"entries": []}')):
