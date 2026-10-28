@@ -26,7 +26,7 @@ on the server; people can use Classic to chat in the room.
   are sent to the selected AI provider. Ordinary room chat is not sent to the AI.
 - Riddles, trivia, number guessing, jokes, light challenges, playful fortunes.
 - Games and scores are held in memory and reset on restart.
-- Arabic and English music search; first YouTube search match, queue, MP3 radio.
+- Arabic and English music search; up to ten numbered choices, queue, MP3 radio.
 - Cooldowns, queue limits, bounded listener buffers, bounded AI history and
   a default cap of 60 AI calls per hour. That cap is not a billing guarantee.
 - No automatic ambient chatter: it responds to mentions, commands and game answers.
@@ -500,7 +500,7 @@ The verified IMVU bot owner can set the language inside each room. Admins and ro
 
 | Command | Result in this room |
 | --- | --- |
-| !language ar-eg | Egyptian Arabic only, including welcomes and scripted bot messages |
+| !language ar-eg | Egyptian Arabic conversational replies |
 | !language en | English only |
 | !language ru | Russian |
 | !language fr | French |
@@ -511,7 +511,7 @@ Arabic alias: !اللغة عربي. Other languages use ISO/BCP-47 codes. Transl
 
 Language choices use a separate room-languages state record under the existing namespace and survive restart. Existing rooms start in automatic mode. Permissions and the room list are unchanged. Save failures keep the previous choice.
 
-Egyptian Arabic output rejects Latin letters outside protected links and uses Arabic command aliases. English output rejects non-Latin scripts. Other common scripts also have guards. Translation failures return a short message in the selected language where available or suppress the response, rather than sending the original wrong-language text. Egyptian welcomes and confirmation messages work without an AI request. Translations use the existing Groq key, bounded caching, and at most 120 attempts per room per hour, in addition to the existing conversation cap.
+Strict language applies to conversational AI replies. Commands, help, admin lists, music titles and game output are sent directly without translation. Welcomes include the joining avatar username and the actual title of that same room; names are preserved exactly. Arabic and Russian rooms have native welcome templates, with an English default for other settings. AI or translation outages suppress the failed conversational reply and use retry backoff rather than repeating an unavailable notice. Conversation translations use the existing Groq key, bounded caching, and at most 120 attempts per room per hour, in addition to the existing conversation cap.
 
 ## Natural follow-up conversations
 
