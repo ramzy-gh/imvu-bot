@@ -73,6 +73,8 @@ class Permissions:
             return "لازم أتأكد من هوية الحساب من السيرفر الأول 🔒"
         if not self.allowed(actor):
             return "This account is blocked from using the bot."
+        if command == "!language":
+            return None if actor == OWNER_ID else "Only the verified bot owner can change this room language."
         if command in ROOM_COMMANDS:
             return None if actor == OWNER_ID or actor in self.room_admins else "Room controls require access granted by owner @Ramzy."
         if command in {"!addroomadmin", "!removeroomadmin", "!roomadmins"}:
@@ -151,7 +153,7 @@ class Permissions:
 
 MANAGEMENT_COMMANDS = {"!addadmin", "!removeadmin", "!admins", "!block", "!unblock", "!blocked",
                        "!addroomadmin", "!removeroomadmin", "!roomadmins"}
-ROOM_COMMANDS = {"!join", "!leave", "!rooms", "!mainroom"}
+ROOM_COMMANDS = {"!join", "!leave", "!rooms", "!mainroom", "!language"}
 
 
 def normalize_management_message(text):

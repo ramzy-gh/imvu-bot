@@ -73,6 +73,15 @@ class RoomManager:
         self.pending = set()
         self.closing = False
         self.telegram = None
+        self.language_store = StateStore("room-languages", str(self.permissions.path.with_name("room-languages.json")))
+        try:
+            from room_language import normalize_language
+            language_data = self.language_store.load() or {"version": 1, "rooms": {}}
+            if not isinstance(language_data.get("rooms"), dict):
+                raise ValueError("Invalid room languages")
+            self.room_languages = {room_id(r): normalize_language(code) for r, code in language_data["rooms"].items()}
+        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+            raise RuntimeError("Cannot load saved room languages; repair language storage before starting.") from None
         self.room_store = StateStore("rooms", os.getenv("ROOMS_PATH", str(self.permissions.path.with_name("rooms.json"))))
         try:
             saved = self.room_store.load()
@@ -91,6 +100,23 @@ class RoomManager:
             await asyncio.to_thread(self.room_store.save, {"version": 1, "rooms": sorted(rooms)})
         except OSError:
             raise ValueError("Could not save room selection. No room change was applied; check persistent storage.") from None
+
+    async def set_language(self, source, value):
+        from room_language import normalize_language
+        code = normalize_language(value)
+        async with self.room_lock:
+            async with source.say_lock:
+                updated = dict(self.room_languages)
+                if code == "auto":
+                    updated.pop(source.room, None)
+                else:
+                    updated[source.room] = code
+                try:
+                    await asyncio.to_thread(self.language_store.save, {"version": 1, "rooms": updated})
+                except OSError:
+                    raise ValueError("Language could not be saved. The previous room setting remains active.") from None
+                self.room_languages = updated
+        return code
 
     async def start(self):
         await self.save_rooms(self.desired_rooms)
@@ -172,7 +198,13 @@ class RoomManager:
             await source.say("You must be present in this connected room to use room controls.")
             return
         try:
-            if cmd == "!mainroom":
+            if cmd == "!language":
+                if not query:
+                    await source.say("Room language: " + self.room_languages.get(source.room, "auto") + ". Owner: !language ar-eg | en | ru | another ISO language code | auto.")
+                else:
+                    code = await self.set_language(source, query)
+                    await source.say("Room language saved: " + code + ". Only this room changed. This setting survives restarts.")
+            elif cmd == "!mainroom":
                 await source.say("Main room: " + self.default_room + " (protected; always connected).")
             elif cmd == "!rooms":
                 await source.say("Rooms: " + " | ".join(
@@ -205,7 +237,8 @@ class RoomManager:
 
     def snapshot(self, bot):
         radio = bot.radio
-        return {"room": bot.room,
+        return {"room": bot.room, "language": self.room_languages.get(bot.room, "auto"),
+            "language_output": getattr(getattr(bot, "speech", None), "status", "automatic"),
             "status": "connected" if bot.connected and bot.chat_ready else "transport_connected" if bot.connected else bot.status,
             "message": bot.status_message, "chat_ready": bot.chat_ready and bot.connected,
             "participants_recognized": len(bot.members), "chat_diagnostics": bot.diagnostics,

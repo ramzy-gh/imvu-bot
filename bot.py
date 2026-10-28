@@ -524,7 +524,9 @@ class Bot:
         self.op = 0
         self.last_said = 0
         self.say_lock = asyncio.Lock()
-        self.social = Social(self.say, allowed=self.permissions.allowed)
+        from room_language import RoomSpeech
+        self.speech = RoomSpeech(self.room_language)
+        self.social = Social(self.say, allowed=self.permissions.allowed, language_policy=self.room_language)
 
     async def api(self, method, path, **kwargs):
         async with self.session.request(method, API + path, **kwargs) as response:
@@ -639,10 +641,17 @@ class Bot:
         await self.ws.send_json(payload)
         return self.op
 
+    def room_language(self):
+        return self.room_manager.room_languages.get(self.room, "auto") if self.room_manager else "auto"
+
     async def say(self, text):
         if not self.connected:
             return False
         async with self.say_lock:
+            if hasattr(self, "speech"):
+                text = await self.speech.render(text)
+                if not text:
+                    return False
             await asyncio.sleep(max(0, self.last_said + 1.5 - time.monotonic()))
             if not self.connected:
                 return False
@@ -868,7 +877,7 @@ class Bot:
                     self.diagnostics["commands_received"] += 1
                     LOG.info("Room command received and queued")
                     self.commands.put_nowait(command)
-                if not picking_song and self.social.interested(text) and not self.social.inbox.full():
+                if not picking_song and self.social.interested(text, uid) and not self.social.inbox.full():
                     self.social.inbox.put_nowait((uid, text))
 
     async def management_command(self, uid, verified, cmd, query):
@@ -1032,7 +1041,7 @@ class Bot:
                     if self.permissions.authorization_error(uid, verified, "!rooms") is None:
                         await self.say("Room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
                     if self.permissions.authorization_error(uid, verified, "!addroomadmin") is None:
-                        await self.say("Owner: !addroomadmin Username | !removeroomadmin Username | !roomadmins. Grant or revoke room-control access separately from regular admins.")
+                        await self.say("Owner: !language ar-eg | !language en | !language ru | !language auto (this room only). !addroomadmin Username | !removeroomadmin Username | !roomadmins.")
             except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError):
                 LOG.warning("A command failed; no credentials or media URLs logged.")
                 with contextlib.suppress(ConnectionError):
