@@ -14,7 +14,7 @@ class StateStore:
     def database(self, value=None, write=False):
         try:
             import psycopg
-            with psycopg.connect(self.database_url, connect_timeout=8, sslmode="require",
+            with psycopg.connect(self.database_url, connect_timeout=8, sslmode=psycopg.conninfo.conninfo_to_dict(self.database_url).get("sslmode", "require"),
                                   options="-c statement_timeout=8000") as conn:
                 conn.execute("CREATE TABLE IF NOT EXISTS ramsei_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL)")
                 if write:
