@@ -241,6 +241,7 @@ class Radio:
         self.skip.set()
         while not self.pcm.empty():
             self.pcm.get_nowait()
+            self.pcm.task_done()
 
     async def broadcast(self, chunk):
         if chunk is not None:
@@ -319,6 +320,9 @@ class Radio:
                 with contextlib.suppress(ConnectionError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
                     await announce("Now playing: " + track["title"])
                 await self.decode_track(track, stop_task)
+                # Decoding runs ahead of playback. Keep the song active until
+                # its final queued samples reach the continuous encoder.
+                await self.pcm.join()
             except (OSError, ValueError):
                 self.last_error = "Audio decoder could not start; check FFmpeg and the song source."
                 LOG.warning(self.last_error)
@@ -423,10 +427,16 @@ class Radio:
                     while True:
                         try:
                             chunk = self.pcm.get_nowait()
+                            queued = True
                         except asyncio.QueueEmpty:
                             chunk = bytes(17640)  # 100 ms of 44.1 kHz stereo s16 PCM
-                        encoder.stdin.write(chunk)
-                        await encoder.stdin.drain()
+                            queued = False
+                        try:
+                            encoder.stdin.write(chunk)
+                            await encoder.stdin.drain()
+                        finally:
+                            if queued:
+                                self.pcm.task_done()
                         deadline += 0.1
                         now = asyncio.get_running_loop().time()
                         if deadline < now:
@@ -464,6 +474,7 @@ class Radio:
                 self.recent_frames.clear()
                 while not self.pcm.empty():
                     self.pcm.get_nowait()
+                    self.pcm.task_done()
             await asyncio.sleep(2)
 
 

@@ -27,8 +27,56 @@ class ToneRadio(Radio):
                 "-ac", "2", "-ar", "44100", "-f", "s16le", "pipe:1"]
 
 
+class InterruptedToneRadio(ToneRadio):
+    def decoder_args(self, track):
+        # First source claims clean EOF too early. The resumed source has a
+        # different tone so the end of the song can be verified in the MP3.
+        offset = track.get("offset", 0)
+        return super().decoder_args(dict(track, frequency=440 if offset == 0 else 880,
+            duration=0.4 if offset == 0 else track["duration"] - offset))
+
+
 @unittest.skipUnless(FFMPEG, "FFmpeg is required for audio integration tests")
 class RadioContinuity(unittest.IsolatedAsyncioTestCase):
+    async def test_early_source_end_recovers_full_tail_on_same_mp3_connection(self):
+        radio = InterruptedToneRadio()
+        output = bytearray()
+        listener = asyncio.Queue(maxsize=256)
+        radio.listeners.add(listener)
+        async def collect():
+            while True:
+                output.extend(await listener.get())
+        with patch.dict(os.environ, {"FFMPEG_BINARY": FFMPEG}):
+            collector = asyncio.create_task(collect())
+            task = asyncio.create_task(radio.run(AsyncMock()))
+            try:
+                radio.queue.put_nowait({"title": "interrupted", "duration": 2.8})
+                await asyncio.wait_for(radio.queue.join(), 12)
+                self.assertTrue(radio.pcm.empty())
+                await asyncio.sleep(0.7)
+                self.assertEqual(radio.encoder_starts, 1)
+                self.assertEqual(radio.source_retries, 1)
+                self.assertEqual(radio.track_starts, 1)
+                self.assertIn(listener, radio.listeners)
+                self.assertIsNone(radio.last_error)
+            finally:
+                task.cancel()
+                collector.cancel()
+                await asyncio.gather(task, collector, return_exceptions=True)
+        decoder = await asyncio.create_subprocess_exec(FFMPEG, "-hide_banner", "-loglevel", "error",
+            "-f", "mp3", "-i", "pipe:0", "-ac", "1", "-ar", "44100", "-f", "s16le", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        pcm, errors = await decoder.communicate(bytes(output))
+        self.assertEqual(decoder.returncode, 0, errors.decode())
+        samples = array.array("h", pcm)
+        # Count audible windows, excluding the deliberate silence during recovery.
+        audible = 0
+        for i in range(0, len(samples) - 4410, 4410):
+            window = samples[i:i + 4410]
+            if sum(s*s for s in window) / len(window) > 100000:
+                audible += 0.1
+        self.assertGreaterEqual(audible, 2.6, "Song tail was lost during recovery")
+
     async def test_two_tracks_decode_on_one_connection_and_one_encoder(self):
         radio = ToneRadio()
         listener = asyncio.Queue(maxsize=256)
