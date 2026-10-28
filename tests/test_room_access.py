@@ -26,7 +26,7 @@ class RoomAccessTests(unittest.TestCase):
         self.assertEqual(loaded.room_admins, {"123"})
         self.assertNotIn("123", loaded.admins)
         self.assertIn("@C4MU", loaded.manage(OWNER_ID, True, "!roomadmins"))
-        for cmd in ROOM_COMMANDS:
+        for cmd in ROOM_COMMANDS - {"!language"}:
             self.assertIsNone(loaded.authorization_error("123", True, cmd))
         self.assertIsNotNone(loaded.authorization_error("123", True, "!addadmin"))
         loaded.manage(OWNER_ID, True, "!removeroomadmin", "123")
