@@ -42,11 +42,11 @@ class LanguageTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {'GROQ_API_KEY':''}):
             for code in ['ar-eg','en','ru']:
                 speech=RoomSpeech(lambda:code)
-                result=await speech.render('Welcome friend!')
+                result=await speech.render('Untranslated foreign sentence')
                 if code == 'ru':
                     self.assertIsNone(result)
                 else:
-                    self.assertTrue(script_ok(result, code))
+                    self.assertIsNone(result)
             auto=RoomSpeech(lambda:'auto')
             self.assertEqual(await auto.render('unchanged'), 'unchanged')
 
@@ -148,6 +148,50 @@ class ConversationTests(unittest.IsolatedAsyncioTestCase):
         social.remember_conversation('speaker','رامسي اهلا',True)
         social.remember_conversation('speaker','خلاص',False)
         self.assertFalse(social.followup('speaker','كمل'))
+
+
+
+class TranslationFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def test_outage_is_silent_and_backed_off(self):
+        from unittest.mock import MagicMock
+        response=MagicMock()
+        response.status=429
+        response.headers={'Retry-After':'120'}
+        response.__aenter__.return_value=response
+        session=MagicMock()
+        session.__aenter__.return_value=session
+        session.post.return_value=response
+        with patch.dict(os.environ,{'GROQ_API_KEY':'test'}), patch('room_language.aiohttp.ClientSession',return_value=session):
+            speech=RoomSpeech(lambda:'ar-eg')
+            for text in ['one foreign sentence','another sentence','a third sentence']:
+                self.assertIsNone(await speech.render(text))
+            self.assertEqual(session.post.call_count,1)
+            self.assertEqual(speech.failure_reason,'http_429')
+            self.assertEqual(await speech.render('تمام، كمل كلامك'),'تمام، كمل كلامك')
+
+    async def test_welcome_music_and_numbers_need_no_translation(self):
+        with patch.dict(os.environ,{'GROQ_API_KEY':''}), patch('room_language.aiohttp.ClientSession') as client:
+            speech=RoomSpeech(lambda:'ar-eg')
+            messages=['Welcome, @Visitor! Great to have you here!', 'Ramsei is here! Try !help',
+                'Queued: Cairokee - تيتي', 'No radio listeners connected. Use !radio for the stream setup.',
+                'Song choices for "cairokee - tee tee":\n1. Cairokee - تيتي\n2. English-only title\nRequester: reply 1-2 within 2 minutes.',
+                'اكتب !play عشان تسمع Cairokee', '١٢٣']
+            for text in messages:
+                rendered=await speech.render(text)
+                if text=='اكتب !play عشان تسمع Cairokee':
+                    self.assertIsNone(rendered)
+                else:
+                    self.assertTrue(script_ok(rendered,'ar-eg'),rendered)
+                    self.assertNotIn('الرد مش متاح',rendered)
+            client.assert_not_called()
+
+    async def test_arabic_aliases_and_links_pass_without_extra_ai_call(self):
+        with patch.dict(os.environ,{'GROQ_API_KEY':''}), patch('room_language.aiohttp.ClientSession') as client:
+            speech=RoomSpeech(lambda:'ar-eg')
+            result=await speech.render('اكتب !play للمزيكا: https://example.com/stream.mp3')
+            self.assertIn('!شغل',result)
+            self.assertIn('https://example.com/stream.mp3',result)
+            client.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
