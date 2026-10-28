@@ -82,8 +82,9 @@ def reply_language(text, previous="en"):
 
 
 class Social:
-    def __init__(self, say, allowed=None, language_policy=None):
+    def __init__(self, say, allowed=None, language_policy=None, chat_say=None):
         self.say = say
+        self.chat_say = chat_say or say
         self.language_policy = language_policy or (lambda: "auto")
         self.allowed = allowed or (lambda uid: True)
         self.game = None
@@ -393,7 +394,7 @@ class Social:
             addressed = bool(NAMES.search(text) or cmd == "!ask")
             answer = await self.ai(uid, arg if cmd == "!ask" else text)
             if self.allowed(uid):
-                await self.say(answer)
+                await self.chat_say(answer)
                 self.remember_conversation(uid, text, addressed)
 
     async def run(self):
