@@ -79,7 +79,7 @@ Example messages:
 | `ADMIN_IDS` | Leave empty; optional first-start admin seed only |
 | `AI_PROVIDER` | `groq` (default), or `gemini` |
 | `GROQ_API_KEY` | Your private Groq API key when using Groq |
-| `GROQ_MODEL` | `openai/gpt-oss-20b` by default |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` by default |
 | `GEMINI_API_KEY` | Optional: your private Google AI Studio API key |
 | `GEMINI_MODEL` | `gemini-flash-latest`, or an available text model for your key |
 | `AI_MAX_CALLS_PER_HOUR` | `60` |
@@ -122,7 +122,7 @@ will be lost on container replacement.
 
 When configured, the app creates `ramsei_state` and stores the login session and
 permission lists there. The database user needs permission to create that table
-and read/write its rows. Connections require TLS. Keep the URL private, keep
+and read/write its rows. Connections require TLS by default. An explicit sslmode in the private connection URL selects the provider-supported mode. Keep the URL private, keep
 `STATE_NAMESPACE` unchanged, and run one active bot per namespace. A distinct bot
 should use a distinct namespace. Use an external database with durable storage,
 not one running inside this same ephemeral Bothost container.
@@ -493,3 +493,26 @@ version after the live test if reproducible builds are needed.
 
 No external code is downloaded or executed on your behalf by this ZIP until you
 deploy it. Dependencies are installed from their normal repositories during the build.
+
+## Owner-only room language
+
+The verified IMVU bot owner can set the language inside each room. Admins and room-control delegates cannot change it.
+
+| Command | Result in this room |
+| --- | --- |
+| !language ar-eg | Egyptian Arabic only, including welcomes and scripted bot messages |
+| !language en | English only |
+| !language ru | Russian |
+| !language fr | French |
+| !language auto | Automatic language matching |
+| !language | Show the current setting |
+
+Arabic alias: !اللغة عربي. Other languages use ISO/BCP-47 codes. Translation quality depends on the model and is not equally reliable for every language. URLs remain functional machine-readable links rather than translated prose.
+
+Language choices use a separate room-languages state record under the existing namespace and survive restart. Existing rooms start in automatic mode. Permissions and the room list are unchanged. Save failures keep the previous choice.
+
+Egyptian Arabic output rejects Latin letters outside protected links and uses Arabic command aliases. English output rejects non-Latin scripts. Other common scripts also have guards. Translation failures return a short message in the selected language where available or suppress the response, rather than sending the original wrong-language text. Egyptian welcomes and confirmation messages work without an AI request. Translations use the existing Groq key, bounded caching, and at most 120 attempts per room per hour, in addition to the existing conversation cap.
+
+## Natural follow-up conversations
+
+Mention Ramsei or use !ask to start. The same participant can then send up to four follow-up turns without repeating the name, while each gap stays under 90 seconds. This applies to general short messages and questions, rather than specific trigger phrases, in Arabic, English and other configured languages. Context is isolated by person and room. Commands, messages directed at another @account, blocked users and expired conversations do not activate follow-up replies. Asking it to stop clears the conversation window. It remains openly an AI companion.
