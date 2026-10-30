@@ -10,7 +10,7 @@ import sys
 import time
 from collections import OrderedDict, deque
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 from aiohttp import web
@@ -145,13 +145,31 @@ def decode_message(packet, queue, members, own_id):
         return None
 
 
+class MusicLookupError(RuntimeError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__({
+            "youtube_blocked": "YouTube is blocking audio from this server. Try a song name for SoundCloud alternatives.",
+            "source_unavailable": "This song source is unavailable. Try another result.",
+            "lookup_failed": "Music lookup failed on the server. Try another result.",
+            "no_results": "No playable alternatives found. Try !play with just the artist and song name.",
+        }[reason])
+
+
 async def capture(*args, timeout=60):
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
-                                                stderr=asyncio.subprocess.DEVNULL)
+                                                stderr=asyncio.subprocess.PIPE)
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout)
         if proc.returncode:
-            raise RuntimeError("YouTube lookup failed; check server access and yt-dlp version.")
+            # Classify internally; never log raw extractor stderr or signed URLs.
+            detail = err.decode("utf-8", errors="replace").lower()
+            reason = ("youtube_blocked" if "confirm you" in detail and "bot" in detail else
+                      "source_unavailable" if any(token in detail for token in
+                          ("video unavailable", "not available", "private video", "http error 403")) else
+                      "lookup_failed")
+            LOG.warning("Music extraction failed: reason=%s exit=%s", reason, proc.returncode)
+            raise MusicLookupError(reason)
         return out
     finally:
         if proc.returncode is None:
@@ -176,6 +194,7 @@ class Radio:
         self.recent_frames = deque(maxlen=10)  # About 260 ms for decoder startup.
         self.listener_resyncs = 0
         self.source_retries = 0
+        self.youtube_blocked_until = 0
 
     @staticmethod
     def lookup_target(query):
@@ -185,12 +204,40 @@ class Radio:
         if re.search(r"\w+://", query):
             from urllib.parse import urlparse
             parsed = urlparse(query)
-            if parsed.scheme != "https" or parsed.hostname not in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"}:
-                raise ValueError("Use a song name or an HTTPS YouTube link.")
+            if parsed.scheme != "https" or parsed.hostname not in {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com", "www.soundcloud.com"}:
+                raise ValueError("Use a song name or an HTTPS YouTube/SoundCloud link.")
             target = query
+        elif re.fullmatch(r"soundcloud-track:[0-9]+", query):
+            target = "https://api.soundcloud.com/tracks/" + query.split(":")[1]
         else:
             target = "ytsearch1:" + query
         return target
+
+    async def search_soundcloud(self, query):
+        self.lookup_target(query)
+        data = json.loads(await capture(sys.executable, "-m", "yt_dlp", "--no-warnings",
+            "--flat-playlist", "--skip-download", "--dump-single-json",
+            "--socket-timeout", "15", "--retries", "1", "--", "scsearch10:" + query))
+        choices, seen = [], set()
+        for item in data.get("entries", []) or []:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("webpage_url") or ""
+            track_id = str(item.get("id") or "")
+            parsed = urlparse(url)
+            duration = item.get("duration")
+            if (parsed.scheme != "https" or parsed.hostname not in {"soundcloud.com", "www.soundcloud.com"}
+                    or not parsed.path.strip("/") or not track_id.isdigit() or track_id in seen
+                    or (isinstance(duration, (int, float)) and not 0 < duration <= 900)):
+                continue
+            seen.add(track_id)
+            choices.append({"title": "[SC] " + " ".join(str(item.get("title") or "Unknown track").split())[:130],
+                            "url": "soundcloud-track:" + track_id})
+            if len(choices) == 10:
+                break
+        if not choices:
+            raise MusicLookupError("no_results")
+        return choices
 
     async def search(self, query):
         target = self.lookup_target(query)
@@ -212,18 +259,102 @@ class Radio:
                 continue
             seen.add(video_id)
             choices.append({"title": " ".join(str(item.get("title") or "Unknown track").split())[:140],
-                            "url": "https://www.youtube.com/watch?v=" + video_id})
+                            "url": "https://www.youtube.com/watch?v=" + video_id, "search_query": query})
             if len(choices) == 10:
                 break
         if not choices:
             raise ValueError("No song choices found. Try a more specific song name.")
         return choices
 
+    @staticmethod
+    def youtube_video_id(target):
+        parsed = urlparse(target)
+        if parsed.scheme != "https":
+            return None
+        if parsed.hostname == "youtu.be":
+            candidate = parsed.path.strip("/")
+        elif parsed.hostname in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
+            parts = parsed.path.strip("/").split("/")
+            candidate = (parse_qs(parsed.query).get("v", [""])[0] if parsed.path == "/watch" else
+                         parts[1] if len(parts) == 2 and parts[0] in {"shorts", "embed", "live"} else "")
+        else:
+            return None
+        return candidate if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate) else None
+
+    @staticmethod
+    def relay_track(data, video_id):
+        if not isinstance(data, dict) or data.get("videoId") != video_id:
+            raise MusicLookupError("source_unavailable")
+        duration = data.get("lengthSeconds")
+        if (data.get("liveNow") or data.get("isUpcoming")
+                or not isinstance(duration, (int, float)) or not 0 < duration <= 900):
+            raise MusicLookupError("source_unavailable")
+        choices = []
+        for item in data.get("adaptiveFormats", []) or []:
+            if not isinstance(item, dict) or not str(item.get("type", "")).startswith("audio/"):
+                continue
+            url = item.get("url")
+            if not isinstance(url, str):
+                continue
+            parsed = urlparse(url)
+            if (parsed.scheme != "https" or parsed.hostname != "yt.chocolatemoo53.com"
+                    or parsed.port not in (None, 443) or parsed.username or parsed.password or parsed.fragment):
+                continue
+            choices.append(item)
+        if not choices:
+            raise MusicLookupError("source_unavailable")
+        # AAC is supported by the existing decoder; other audio formats may also work.
+        selected = next((item for item in choices if str(item.get("itag")) == "140"), choices[0])
+        return {"title": " ".join(str(data.get("title") or "Unknown track").split())[:140],
+                "url": selected["url"], "duration": duration,
+                "source": "https://www.youtube.com/watch?v=" + video_id,
+                "provider": "youtube_relay"}
+
+    async def lookup_relay(self, video_id):
+        # Fixed, tested service only. Never forward cookies, login data or room chat.
+        endpoint = "https://yt.chocolatemoo53.com/api/v1/videos/" + video_id + "?local=true"
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                async with session.get(endpoint, allow_redirects=False) as response:
+                    if response.status != 200:
+                        LOG.warning("YouTube audio relay unavailable: HTTP %s", response.status)
+                        raise MusicLookupError("source_unavailable")
+                    payload = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        payload.extend(chunk)
+                        if len(payload) > 2_000_000:
+                            raise MusicLookupError("source_unavailable")
+                    data = json.loads(payload)
+            track = self.relay_track(data, video_id)
+            LOG.info("YouTube audio resolved through external relay")
+            return track
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
+            LOG.warning("YouTube audio relay request failed; no media URLs logged")
+            raise MusicLookupError("source_unavailable") from None
+
     async def lookup(self, query):
         target = self.lookup_target(query)
-        data = json.loads(await capture(sys.executable, "-m", "yt_dlp", "--no-warnings",
-            "--no-playlist", "--skip-download", "--dump-single-json", "--js-runtimes", "node",
-            "--socket-timeout", "15", "--retries", "1", "-f", "bestaudio/best", "--", target))
+        if target.startswith("ytsearch1:"):
+            target = (await self.search(query))[0]["url"]
+        video_id = self.youtube_video_id(target)
+        if video_id and time.monotonic() < self.youtube_blocked_until:
+            try:
+                return await self.lookup_relay(video_id)
+            except MusicLookupError:
+                raise MusicLookupError("youtube_blocked") from None
+        try:
+            data = json.loads(await capture(sys.executable, "-m", "yt_dlp", "--no-warnings",
+                "--no-playlist", "--skip-download", "--dump-single-json", "--js-runtimes", "node",
+                "--socket-timeout", "15", "--retries", "1", "-f", "bestaudio/best", "--", target))
+        except MusicLookupError as error:
+            if video_id and error.reason == "youtube_blocked":
+                self.youtube_blocked_until = time.monotonic() + 1800
+            if video_id:
+                try:
+                    return await self.lookup_relay(video_id)
+                except MusicLookupError:
+                    pass  # Keep the existing SoundCloud-choice fallback when the relay fails.
+            raise
         if "entries" in data:
             data = next((item for item in data["entries"] if item), {})
         if not data.get("url") or not data.get("duration") or data.get("is_live"):
@@ -235,7 +366,7 @@ class Radio:
             raise ValueError("This result has no supported secure audio source.")
         return {"title": str(data.get("title", "Unknown track"))[:140],
                 "url": data["url"], "duration": data["duration"],
-                "source": data.get("webpage_url") or target}
+                "source": query if query.startswith("soundcloud-track:") else data.get("webpage_url") or target}
 
     def interrupt(self):
         self.skip.set()
@@ -287,7 +418,7 @@ class Radio:
                 "-protocol_whitelist", "https,tls,tcp,crypto", "-rw_timeout", "15000000",
                 "-reconnect", "1", "-reconnect_on_network_error", "1",
                 "-reconnect_on_http_error", "429,5xx", "-reconnect_delay_max", "5",
-                "-ss", str(track.get("offset", 0)), "-i", track["url"],
+                "-i", track["url"], "-ss", str(track.get("offset", 0)),
                 "-t", str(max(0.1, 900 - track.get("offset", 0))), "-vn", "-ac", "2", "-ar", "44100",
                 "-f", "s16le", "pipe:1"]
 
@@ -965,8 +1096,16 @@ class Bot:
         if not 1 <= number <= len(choices):
             await self.say(f"Pick a number from 1 to {len(choices)} for your song search.")
             return
-        if await self.queue_song(uid, choices[number - 1]["url"]):
-            self.song_choices.pop(uid, None)
+        choice = choices[number - 1]
+        try:
+            if await self.queue_song(uid, choice["url"]):
+                self.song_choices.pop(uid, None)
+        except MusicLookupError as error:
+            if error.reason != "youtube_blocked":
+                raise
+            await self.say("YouTube blocks audio from this server. Here are SoundCloud alternatives; pick a new number.")
+            alternatives = await self.radio.search_soundcloud(choice.get("search_query", choice["title"]))
+            await self.offer_song_choices(uid, "SoundCloud alternatives", alternatives)
 
     async def play_request(self, uid, query):
         self.song_choices.pop(uid, None)
@@ -985,6 +1124,11 @@ class Bot:
             return
         if len(choices) == 1:
             await self.queue_song(uid, choices[0]["url"])
+            return
+        await self.offer_song_choices(uid, query, choices)
+
+    async def offer_song_choices(self, uid, query, choices):
+        if uid not in self.members or not self.permissions.allowed(uid):
             return
         now = time.monotonic()
         self.song_choices = OrderedDict((key, value) for key, value in self.song_choices.items() if value[0] > now)
@@ -1072,8 +1216,12 @@ class Bot:
                         await self.say("Room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
                     if self.permissions.authorization_error(uid, verified, "!addroomadmin") is None:
                         await self.say("Owner: !language ar-eg | !language en | !language ru | !language auto (this room only). !addroomadmin Username | !removeroomadmin Username | !roomadmins.")
-            except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError):
-                LOG.warning("A command failed; no credentials or media URLs logged.")
+            except MusicLookupError as error:
+                LOG.warning("Music command failed: reason=%s", error.reason)
+                with contextlib.suppress(ConnectionError):
+                    await self.say(str(error))
+            except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError) as error:
+                LOG.warning("A command failed: type=%s; no credentials or media URLs logged.", type(error).__name__)
                 with contextlib.suppress(ConnectionError):
                     await self.say("Could not complete that request. Try another song or check the server logs.")
             finally:
