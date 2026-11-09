@@ -58,6 +58,7 @@ class Authentication:
                     bot.session.headers["X-Imvu-Sauce"])
             uid, cookies, sauce = self.saved
             bot.user_id = uid
+            bot.session.cookie_jar.clear(lambda cookie: cookie.key in cookies)
             bot.session.cookie_jar.update_cookies(cookies, response_url=URL(API))
             bot.cookie = bot.session.cookie_jar.filter_cookies(URL(API)).get("osCsid")
             bot.session.headers.update({"X-Imvu-Sauce": sauce, "X-Imvu-Application": "next_desktop/1"})
@@ -65,14 +66,20 @@ class Authentication:
 
 class RoomManager:
     def __init__(self):
-        self.permissions = Permissions()
+        self.default_room = room_id(os.getenv("IMVU_ROOM_ID", "330286535-177"))
+        self.permissions = Permissions(self.default_room)
         self.authentication = Authentication()
         self.rooms = {}
-        self.default_room = room_id(os.getenv("IMVU_ROOM_ID", "330286535-177"))
+        self.room_access_check = None
+        self.room_registered = None
+        self.room_paused = None
+        self.room_health_changed = None
         self.room_lock = asyncio.Lock()
         self.pending = set()
         self.closing = False
         self.telegram = None
+        from room_settings import RoomSettings
+        self.settings = RoomSettings(self.permissions.path.with_name("room-settings.json"))
         self.language_store = StateStore("room-languages", str(self.permissions.path.with_name("room-languages.json")))
         try:
             from room_language import normalize_language
@@ -102,21 +109,28 @@ class RoomManager:
             raise ValueError("Could not save room selection. No room change was applied; check persistent storage.") from None
 
     async def set_language(self, source, value):
+        return await self.set_room_language(source.room, value, source.say_lock)
+
+    async def set_room_language(self, room, value, say_lock=None):
         from room_language import normalize_language
+        room = room_id(room)
         code = normalize_language(value)
         async with self.room_lock:
-            async with source.say_lock:
-                updated = dict(self.room_languages)
-                if code == "auto":
-                    updated.pop(source.room, None)
-                else:
-                    updated[source.room] = code
-                try:
-                    await asyncio.to_thread(self.language_store.save, {"version": 1, "rooms": updated})
-                except OSError:
-                    raise ValueError("Language could not be saved. The previous room setting remains active.") from None
-                self.room_languages = updated
+            async with say_lock if say_lock is not None else contextlib.nullcontext():
+                await self.save_room_language(room, code)
         return code
+
+    async def save_room_language(self, room, code):
+        updated = dict(self.room_languages)
+        if code == "auto":
+            updated.pop(room, None)
+        else:
+            updated[room] = code
+        try:
+            await asyncio.to_thread(self.language_store.save, {"version": 1, "rooms": updated})
+        except OSError:
+            raise ValueError("Language could not be saved. The previous room setting remains active.") from None
+        self.room_languages = updated
 
     async def start(self):
         await self.save_rooms(self.desired_rooms)
@@ -131,6 +145,8 @@ class RoomManager:
         async with self.room_lock:
             if self.closing:
                 raise ValueError("Bot is shutting down; try again after restart.")
+            if self.room_access_check and not self.room_access_check(room):
+                raise ValueError("This room's access has expired. The website owner can renew it.")
             if room in self.rooms and not self.rooms[room][1].done():
                 return "Already joining/joined " + room
             desired = self.desired_rooms | {room}
@@ -141,6 +157,8 @@ class RoomManager:
             bot = Bot(Radio(), room, self.permissions, self.authentication, room_manager=self)
             task = asyncio.create_task(self.serve(bot), name="room-" + room)
             self.rooms[room] = (bot, task)
+            if self.room_registered:
+                self.room_registered(room)
             return "Join requested for " + room + "; use !rooms to check readiness."
 
     async def serve(self, bot):
@@ -151,6 +169,8 @@ class RoomManager:
                  (bot.run(), bot.command_worker(), bot.social.run(), audio())]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if self.room_health_changed:
+                self.room_health_changed(bot.room, "worker_stopped")
             for task in done:
                 task.result()
         except Exception as error:
@@ -167,18 +187,50 @@ class RoomManager:
             await asyncio.gather(*tasks, return_exceptions=True)
             await bot.radio.broadcast(None)
 
-    async def leave(self, room):
+    async def leave(self, room, *, manual=False):
         room = room_id(room)
         async with self.room_lock:
             if room == self.default_room:
                 raise ValueError("Main room " + self.default_room + " is protected and always stays connected.")
             if room not in self.rooms and room not in self.desired_rooms:
+                if manual and self.room_paused:
+                    self.room_paused(room)
                 return "Room is not active: " + room
             desired = self.desired_rooms - {room}
             await self.save_rooms(desired)
             self.desired_rooms = desired
             await self.stop_room(room)
+            if manual and self.room_paused:
+                self.room_paused(room)
             return "Stopped room " + room + " (IMVU presence removal requested)"
+
+    async def remove_room(self, room):
+        room = room_id(room)
+        async with self.room_lock:
+            if room == self.default_room:
+                raise ValueError("The main room is protected and cannot be removed.")
+            removal = asyncio.create_task(self._remove_room(room))
+            try:
+                await asyncio.shield(removal)
+            except asyncio.CancelledError:
+                await removal
+                raise
+
+    async def _remove_room(self, room):
+        if room in self.desired_rooms:
+            desired = self.desired_rooms - {room}
+            await self.save_rooms(desired)
+            self.desired_rooms = desired
+        await self.stop_room(room)
+        try:
+            if room in self.room_languages:
+                await self.save_room_language(room, "auto")
+            await self.settings.remove(room)
+            await asyncio.to_thread(self.permissions.remove_room, room)
+            if self.telegram:
+                await self.telegram.remove_room(room)
+        except (OSError, ValueError):
+            raise ValueError("The room is disconnected, but some saved data could not be removed. Try Remove room again.") from None
 
     async def stop_room(self, room):
         entry = self.rooms.get(room)
@@ -190,7 +242,7 @@ class RoomManager:
         self.rooms.pop(room, None)
 
     async def chat_command(self, source, uid, verified, cmd, query):
-        error = self.permissions.authorization_error(uid, verified, cmd)
+        error = self.permissions.authorization_error(uid, verified, cmd, source.room)
         if error:
             await source.say(error)
             return
@@ -224,7 +276,7 @@ class RoomManager:
                 await source.say("Leave requested for " + target + ". Main room remains connected.")
                 async def finish_leave():
                     try:
-                        result = await self.leave(target)
+                        result = await self.leave(target, manual=True)
                         if source.room != target:
                             await source.say(result)
                     except ValueError as error:
@@ -238,6 +290,8 @@ class RoomManager:
     def snapshot(self, bot):
         radio = bot.radio
         return {"room": bot.room, "language": self.room_languages.get(bot.room, "auto"),
+            "quiet": self.settings.get(bot.room)["quiet"],
+            "welcomes": self.settings.get(bot.room)["welcomes"],
             "language_output": getattr(getattr(bot, "speech", None), "status", "automatic"),
             "status": "connected" if bot.connected and bot.chat_ready else "transport_connected" if bot.connected else bot.status,
             "message": bot.status_message, "chat_ready": bot.chat_ready and bot.connected,
@@ -261,7 +315,7 @@ class RoomManager:
     async def stream(self, request):
         room = request.match_info.get("room", self.default_room)
         entry = self.rooms.get(room)
-        if entry is None or entry[1].done():
+        if entry is None or entry[1].done() or (self.room_access_check and not self.room_access_check(room)):
             raise web.HTTPNotFound(text="Room is not active")
         return await entry[0].radio.stream(request)
 
@@ -274,7 +328,7 @@ class RoomManager:
         if len(parts) == 2 and parts[0] == "join":
             return await self.join(parts[1])
         if len(parts) == 2 and parts[0] == "leave":
-            return await self.leave(parts[1])
+            return await self.leave(parts[1], manual=True)
         return "Commands: rooms | join ROOM_ID | leave ROOM_ID | help"
 
     async def terminal(self):
@@ -341,5 +395,7 @@ class RoomManager:
         for task in tuple(self.pending):
             task.cancel()
         await asyncio.gather(*self.pending, return_exceptions=True)
-        for room in list(self.rooms):
+        for room, (bot, _) in list(self.rooms.items()):
+            if self.room_health_changed and getattr(bot, "connected", False) and getattr(bot, "chat_ready", False):
+                self.room_health_changed(room, "service_restart")
             await self.stop_room(room)

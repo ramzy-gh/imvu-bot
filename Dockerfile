@@ -11,7 +11,10 @@ COPY wardrobe.py ./
 COPY movement.py ./
 COPY telegram_bridge.py ./
 COPY room_control.py ./
+COPY room_language.py room_settings.py private_invites.py telegram_controls.py ramsei_web.py ramsei_web.css ramzy_locale.py ./
+COPY ramzy_share.png.b64 ./
 COPY local_control.py botctl.py ./
+COPY migrate_database.py ./
 RUN useradd --create-home bot && mkdir -p /app/data && chown -R bot:bot /app
 COPY entrypoint.sh /usr/local/bin/ramsei-entrypoint
 RUN sed -i 's/\r$//' /usr/local/bin/ramsei-entrypoint && chmod 755 /usr/local/bin/ramsei-entrypoint

@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 from personality import ALIASES, Social
-from permissions import Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normalize_management_message
+from permissions import OWNER_ID, Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normalize_management_message
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
 from wardrobe import load_named_outfit, OutfitError
@@ -658,7 +658,11 @@ class Bot:
         self.say_lock = asyncio.Lock()
         from room_language import RoomSpeech
         self.speech = RoomSpeech(self.room_language)
-        self.social = Social(self.say, allowed=self.permissions.allowed, language_policy=self.room_language, chat_say=self.say_chat)
+        self.social = Social(self.say, allowed=self.allowed_in_room, language_policy=self.room_language, chat_say=self.say_chat)
+        self.social.quiet_policy = lambda: self.room_preferences()["quiet"]
+
+    def allowed_in_room(self, uid):
+        return self.permissions.allowed(uid, self.room)
 
     async def api(self, method, path, **kwargs):
         async with self.session.request(method, API + path, **kwargs) as response:
@@ -720,6 +724,10 @@ class Bot:
         if not password:
             raise RuntimeError("Set IMVU_PASSWORD privately in Bothost environment variables.")
         payload = {"username": username, "password": password, "gdpr_cookie_acceptance": False}
+        # A restored host-only cookie overrides a fresh .imvu.com cookie.
+        # Remove stale credentials before refreshing, including the old sauce.
+        self.session.cookie_jar.clear(lambda cookie: cookie.key == "osCsid")
+        self.session.headers.pop("X-Imvu-Sauce", None)
         async with self.session.post(API + "/login", json=payload) as response:
             if response.status == 202:
                 raise LoginPaused("verification_required", "IMVU requires additional verification. V6 supports password-only login and cannot complete this challenge. Login is paused; no automatic retries. Resolve account verification through IMVU before restarting.")
@@ -754,6 +762,7 @@ class Bot:
             self.authenticated.clear()
             self.status = error.status if isinstance(error, LoginPaused) else "login_paused"
             self.status_message = str(error) if isinstance(error, RuntimeError) else "Login could not complete. Check configuration/network, then restart once."
+            self.report_room_health("sign_in_failed")
             LOG.warning("%s", self.status_message)
             await asyncio.Event().wait()  # Only an explicit process restart attempts login again.
             return
@@ -776,6 +785,10 @@ class Bot:
     def room_language(self):
         manager = getattr(self, "room_manager", None)
         return getattr(manager, "room_languages", {}).get(self.room, "auto")
+
+    def room_preferences(self):
+        settings = getattr(getattr(self, "room_manager", None), "settings", None)
+        return settings.get(self.room) if settings else {"quiet": False, "welcomes": True, "welcome": ""}
 
     async def say_chat(self, text):
         rendered = await self.speech.render(text)
@@ -819,8 +832,16 @@ class Bot:
         path = f"/chat/chat-{self.room}/participants"
         data = await self.api("GET", path)
         new = participant_ids(data, API + path)
+        if self.members_initialized and self.user_id in self.members and self.user_id not in new:
+            raise RuntimeError("Membership snapshot omitted the bot; no join/leave events recorded.")
         self.last_membership_refresh = time.monotonic()
         if self.members_initialized:
+            bridge = getattr(self.room_manager, "telegram", None)
+            if bridge:
+                for uid in sorted(new - self.members - {self.user_id}):
+                    bridge.record_membership(self.room, uid, "joined")
+                for uid in sorted(self.members - new - {self.user_id}):
+                    bridge.record_membership(self.room, uid, "left")
             if new - self.members - {self.user_id}:
                 self.appearance_pending = True
             for uid in sorted(new - self.members - {self.user_id}):
@@ -840,13 +861,17 @@ class Bot:
 
     async def send_welcomes(self):
         async with self.welcome_lock:
+            prefs = self.room_preferences()
+            if not prefs["welcomes"]:
+                self.pending_welcomes.clear()
+                return
             if not self.connected or not self.chat_ready:
                 return
             if self.pending_welcomes:
                 with contextlib.suppress(RuntimeError, ValueError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError):
                     await self.announce_seat()
             for uid in list(self.pending_welcomes):
-                if uid not in self.members or uid == self.user_id or not self.permissions.allowed(uid):
+                if uid not in self.members or uid == self.user_id or not self.allowed_in_room(uid):
                     self.pending_welcomes.pop(uid, None)
                     continue
                 if time.monotonic() - self.greeted.get(uid, -1000) < 300:
@@ -858,16 +883,16 @@ class Bot:
                     name = info.get("username")
                     if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,40}", name):
                         continue
-                    if uid not in self.members or not self.permissions.allowed(uid):
+                    if uid not in self.members or not self.allowed_in_room(uid):
                         self.pending_welcomes.pop(uid, None)
                         continue
                     room_name = getattr(self, "room_name", self.room)
-                    if self.room_language().startswith("ar"):
-                        greeting = f"نورت روم {room_name} يا @{name}! للمزيكا !play وللعب !game."
-                    elif self.room_language().startswith("ru"):
-                        greeting = f"Добро пожаловать, @{name}, в комнату {room_name}! Музыка: !play | Игры: !game"
-                    else:
-                        greeting = f"Welcome, @{name}, to {room_name}! Music: !play <song or artist> | Games: !game"
+                    prefs = self.room_preferences()
+                    if not prefs["welcomes"]:
+                        self.pending_welcomes.clear()
+                        return
+                    from room_language import welcome_message
+                    greeting = welcome_message(self.room_language(), prefs["welcome"], name, room_name)
                     sent = await self.say(greeting)
                     if not sent:
                         continue
@@ -957,10 +982,16 @@ class Bot:
                                "source": "named_saved_outfit", "name": self.outfit_name, "reason": reason}
             LOG.warning("Named outfit not announced: reason=%s; no profile/default substitution", reason)
 
+    def report_room_health(self, reason=None):
+        report = getattr(self.room_manager, "room_health_changed", None)
+        if report:
+            report(self.room, reason)
+
     async def confirm_chat_ready(self):
         if self.chat_ready:
             return
         self.chat_ready = True
+        self.report_room_health()
         LOG.info("Room chat subscription confirmed; checking message delivery")
         await self.announce_appearance()
         if not self.announced:
@@ -1023,7 +1054,7 @@ class Bot:
                     bridge.record(self.room, uid, text)
                 text = normalize_management_message(text)
                 command = uid, text, verified
-                if not self.permissions.allowed(uid):
+                if not self.allowed_in_room(uid):
                     continue
                 picking_song = uid in self.song_choices and self.is_song_number(text)
                 if (text.startswith("!") or picking_song) and not self.commands.full():
@@ -1034,13 +1065,17 @@ class Bot:
                     self.social.inbox.put_nowait((uid, text))
 
     async def management_command(self, uid, verified, cmd, query):
-        error = self.permissions.authorization_error(uid, verified, cmd)
+        error = self.permissions.authorization_error(uid, verified, cmd, self.room)
         if error:
             await self.say(error)
             return
-        if cmd in {"!admins", "!blocked", "!roomadmins"}:
-            ids = {"!admins": self.permissions.admins, "!blocked": self.permissions.blocked,
-                   "!roomadmins": self.permissions.room_admins}[cmd]
+        if cmd == "!owneronly":
+            await self.say(await asyncio.to_thread(self.permissions.manage, uid, verified, cmd, query, room=self.room))
+            return
+        if cmd in {"!admins", "!blocked", "!roomadmins", "!ownerblocked"}:
+            admins, blocked = self.permissions.moderation(self.room)
+            ids = {"!admins": admins, "!blocked": blocked,
+                   "!roomadmins": self.permissions.room_admins, "!ownerblocked": self.permissions.owner_blocked}[cmd]
             for target in sorted(ids)[:12]:
                 try:
                     data = await self.api("GET", f"/user/user-{target}")
@@ -1050,31 +1085,32 @@ class Bot:
                         self.permissions.names[target] = name
                 except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
                     pass  # Fall back to saved usernames when lookup is unavailable.
-            await self.say(self.permissions.manage(uid, verified, cmd))
+            await self.say(self.permissions.manage(uid, verified, cmd, room=self.room))
             return
         try:
             target, username = await resolve_username(self.api, query)
         except UserLookupError as error:
             await self.say(str(error))
             return
-        await self.say(await asyncio.to_thread(self.permissions.manage, uid, verified, cmd, target, username=username))
+        await self.say(await asyncio.to_thread(self.permissions.manage, uid, verified, cmd, target, username=username, room=self.room))
 
     @staticmethod
     def is_song_number(text):
         return re.fullmatch(r"[0-9٠-٩]{1,2}", text.strip()) is not None
 
     async def queue_song(self, uid, url):
-        if uid not in self.members or not self.permissions.allowed(uid):
+        if uid not in self.members or not self.allowed_in_room(uid):
             return False
         if self.radio.queue.full():
             await self.say("The music queue is full. Please try later.")
             return False
         track = await self.radio.lookup(url)
-        if uid not in self.members or not self.permissions.allowed(uid):
+        if uid not in self.members or not self.allowed_in_room(uid):
             return False
         if self.radio.queue.full():
             await self.say("The music queue is full. Please try later.")
             return False
+        track["requester_id"] = str(uid)
         self.radio.queue.put_nowait(track)
         if self.radio.idle:
             self.radio.interrupt()
@@ -1120,7 +1156,7 @@ class Bot:
             await self.queue_song(uid, query)
             return
         choices = await self.radio.search(query)
-        if uid not in self.members or not self.permissions.allowed(uid):
+        if uid not in self.members or not self.allowed_in_room(uid):
             return
         if len(choices) == 1:
             await self.queue_song(uid, choices[0]["url"])
@@ -1128,7 +1164,7 @@ class Bot:
         await self.offer_song_choices(uid, query, choices)
 
     async def offer_song_choices(self, uid, query, choices):
-        if uid not in self.members or not self.permissions.allowed(uid):
+        if uid not in self.members or not self.allowed_in_room(uid):
             return
         now = time.monotonic()
         self.song_choices = OrderedDict((key, value) for key, value in self.song_choices.items() if value[0] > now)
@@ -1158,7 +1194,7 @@ class Bot:
                 cmd = parts[0] if parts else ""
                 query = parts[1] if len(parts) > 1 else ""
                 cmd = ALIASES.get(cmd.lower(), cmd.lower())
-                if not self.permissions.allowed(uid):
+                if not self.allowed_in_room(uid):
                     continue
                 if self.is_song_number(text) and uid in self.song_choices:
                     # A selection must work immediately after its search; the
@@ -1197,6 +1233,9 @@ class Bot:
                         if reply:
                             await self.say(reply)
                 elif cmd in {"!skip", "!stop"}:
+                    if self.radio.current and self.radio.current.get("requester_id") == OWNER_ID and (str(uid) != OWNER_ID or not verified):
+                        await self.say("Only @Ramzy can skip or stop the owner's music.")
+                        continue
                     if cmd == "!stop":
                         while not self.radio.queue.empty():
                             self.radio.queue.get_nowait()
@@ -1212,10 +1251,10 @@ class Bot:
                 else:
                     await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | !move: come near you | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
                     await self.say("Music search: !play <song or artist>, then reply 1-10 to choose. A YouTube link queues directly.")
-                    if self.permissions.authorization_error(uid, verified, "!rooms") is None:
+                    if self.permissions.authorization_error(uid, verified, "!rooms", self.room) is None:
                         await self.say("Room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
-                    if self.permissions.authorization_error(uid, verified, "!addroomadmin") is None:
-                        await self.say("Owner: !language ar-eg | !language en | !language ru | !language auto (this room only). !addroomadmin Username | !removeroomadmin Username | !roomadmins.")
+                    if self.permissions.authorization_error(uid, verified, "!addroomadmin", self.room) is None:
+                        await self.say("Owner: !ownerblock Username | !ownerunblock Username | !ownerblocked | !owneronly on/off. !language ar-eg | !language en | !language ru | !language auto (this room only). !addroomadmin Username | !removeroomadmin Username | !roomadmins.")
             except MusicLookupError as error:
                 LOG.warning("Music command failed: reason=%s", error.reason)
                 with contextlib.suppress(ConnectionError):
@@ -1234,6 +1273,7 @@ class Bot:
             await self.login_or_pause()
             delay = 5
             while True:
+                ready = False
                 try:
                     await self.update_account_presence()
                     await self.api("POST", f"/chat/chat-{self.room}/participants", json={})
@@ -1243,6 +1283,8 @@ class Bot:
                     self.queue = info.get("imq_queue")
                     if not self.queue:
                         raise RuntimeError("IMVU did not return a room queue.")
+                    self.members_initialized = False  # Reconnect establishes a new baseline, not arrival spam.
+                    self.pending_welcomes.clear()
                     await self.participants()
                     async with self.session.ws_connect(IMQ, origin="https://www.imvu.com", timeout=aiohttp.ClientWSTimeout(ws_receive=60)) as self.ws:
                         await self.ws.send_json({"record": "msg_c2g_connect", "op_id": 0,
@@ -1270,16 +1312,26 @@ class Bot:
                             for task in done:
                                 task.result()
                         finally:
+                            ready = self.chat_ready
                             self.connected = False
                             self.chat_ready = False
                             for task in tasks:
                                 task.cancel()
                             await asyncio.gather(*tasks, return_exceptions=True)
+                    self.report_room_health("connection_lost" if ready else "connection_failed")
                 except AuthenticationRequired:
                     self.connected = False
+                    self.report_room_health("session_expired")
                     LOG.warning("Saved login expired; trying password-only IMVU login")
                     await self.login_or_pause(force=True)
                 except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, ValueError) as error:
+                    if isinstance(error, IMVURequestError) and error.status in (403, 404):
+                        reason = "room_unavailable"
+                    elif isinstance(error, asyncio.TimeoutError):
+                        reason = "connection_timeout"
+                    else:
+                        reason = "connection_lost" if ready else "connection_failed"
+                    self.report_room_health(reason)
                     detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
                     LOG.warning("Room connection lost (%s); retrying in %s seconds", detail, delay)
                 finally:
@@ -1301,7 +1353,12 @@ async def main():
     from room_control import RoomManager
     manager = RoomManager()
     app = web.Application()
-    app.router.add_get("/health", manager.health)
+    portal = None
+    if os.getenv("RAMSEI_WEB_ENABLED") == "1":
+        from ramsei_web import install_website
+        portal = install_website(app, manager)
+    else:
+        app.router.add_get("/health", manager.health)
     app.router.add_get("/stream.mp3", manager.stream)
     app.router.add_get("/rooms/{room}/stream.mp3", manager.stream)
     runner = web.AppRunner(app)
@@ -1312,8 +1369,18 @@ async def main():
     LOG.info("Radio endpoint /stream.mp3; diagnostic status /health")
     terminal = None
     control = None
+    private_invites = None
+    billing_task = None
     try:
+        if portal and portal.billing_test:
+            portal.filter_startup_rooms()
+        elif portal:
+            portal.prepare_owner_rooms()
         await manager.start()
+        if portal:
+            billing_task = asyncio.create_task(portal.watch_access())
+        from private_invites import PrivateInvites
+        private_invites = asyncio.create_task(PrivateInvites(manager).run())
         if os.getenv("TERMINAL_CONTROL", "0") == "1":
             from local_control import LocalControl
             control = LocalControl(manager.command)
@@ -1321,6 +1388,12 @@ async def main():
             terminal = asyncio.create_task(manager.terminal())
         await asyncio.Event().wait()
     finally:
+        if billing_task:
+            billing_task.cancel()
+            await asyncio.gather(billing_task, return_exceptions=True)
+        if private_invites:
+            private_invites.cancel()
+            await asyncio.gather(private_invites, return_exceptions=True)
         if control:
             await control.close()
         if terminal:

@@ -38,6 +38,17 @@ def language_name(code):
     return 'Egyptian Arabic (عامية مصرية), never Modern Standard Arabic' if code == 'ar-eg' else 'the language identified by ISO/BCP-47 code ' + code
 
 
+def welcome_message(language, custom, name, room_name):
+    if custom:
+        greeting = custom.replace("{name}", "@" + name).replace("{room}", " ".join(room_name.split()))
+        return "Welcome! " + greeting if greeting.lstrip().startswith("*") else greeting
+    if language.startswith("ar"):
+        return f"نورت روم {room_name} يا @{name}! للمزيكا !play وللعب !game."
+    if language.startswith("ru"):
+        return f"Добро пожаловать, @{name}, в комнату {room_name}! Музыка: !play | Игры: !game"
+    return f"Welcome, @{name}, to {room_name}! Music: !play <song or artist> | Games: !game"
+
+
 def script_ok(text, code):
     base = code.split('-')[0]
     scripts = {'ar':('ARABIC',), 'fa':('ARABIC',), 'ur':('ARABIC',),

@@ -5,6 +5,7 @@ import random
 import re
 import time
 import logging
+import unicodedata
 from collections import OrderedDict
 import aiohttp
 from offline_chat import OfflineChat
@@ -19,7 +20,13 @@ def normalize(text):
         str.maketrans("أإآىة٠١٢٣٤٥٦٧٨٩", "ااايه0123456789"))
 
 
-ALIASES = {"!شغل": "!play", "!طابور": "!queue", "!الاغنية": "!np",
+def normalize_answer(text):
+    text = unicodedata.normalize("NFKC", text)
+    text = "".join(char for char in text if unicodedata.category(char) != "Cf")
+    return " ".join(normalize(text).strip(" .!?،؟؛…").split())
+
+
+ALIASES = {"!games": "!game", "!شغل": "!play", "!طابور": "!queue", "!الاغنية": "!np",
            "!عدي": "!skip", "!وقف": "!stop", "!مساعدة": "!help",
            "!لعبة": "!game", "!تخمين": "!guess", "!جاوب": "!answer",
            "!نكتة": "!joke", "!حظ": "!fortune", "!تحدي": "!dare",
@@ -199,9 +206,9 @@ class Social:
             self.game = None
             await self.say(("الجولة خلصت يا أبطال ⏰ الإجابة: " if language == "ar" else "Time's up! ⏰ Answer: ") + game["display"] + " | !game")
             return False
-        value = normalize(text)
+        value = normalize_answer(text)
         if game["kind"] == "number":
-            if not value.isdigit():
+            if not value.isdecimal():
                 return False
             number = int(value)
             if number != game["answer"]:
@@ -356,17 +363,21 @@ class Social:
     async def handle(self, uid, text):
         if not self.allowed(uid):
             return
+        cmd, _, arg = text.partition(" ")
+        cmd = ALIASES.get(cmd.lower(), cmd.lower())
         language = self.language(uid, text)
+        answer = arg if cmd in {"!answer", "!guess"} and arg else text
+        if await self.check_answer(uid, answer):
+            return
+        quiet = getattr(self, "quiet_policy", lambda: False)
+        if quiet() and not (NAMES.search(text) or text.lstrip().startswith("!")):
+            return
         now = time.monotonic()
         if now - self.cooldowns.get(uid, -1000) < 3:
             return
         self.cooldowns[uid] = now
         if len(self.cooldowns) > 300:
             self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < 60}
-        cmd, _, arg = text.partition(" ")
-        cmd = ALIASES.get(cmd.lower(), cmd.lower())
-        if await self.check_answer(uid, arg if cmd in {"!answer", "!guess"} and arg else text):
-            return
         if cmd in {"!game", "!guess"}:
             if self.game:
                 await self.say("فيه جولة شغالة لسه يا نجم! 🎲 جاوب عليها الأول 😄" if language == "ar" else "There's already a round in progress! 🎲 Try answering it first 😄")
@@ -377,7 +388,7 @@ class Social:
                 await self.say("خبيت رقم من ١ لـ ٣٠ 🤫🎲 اكتب تخمينك في الشات وأنا أقولك أعلى ولا أقل! معاكوا دقيقتين." if language == "ar" else "I'm thinking of a number from 1 to 30 🤫🎲 Guess in chat! I'll say higher or lower. You've got two minutes.")
             else:
                 question, answers = random.choice(QUESTIONS if language == "ar" else EN_QUESTIONS)
-                self.game = {"kind": "quiz", "answers": {normalize(a) for a in answers},
+                self.game = {"kind": "quiz", "answers": {normalize_answer(a) for a in answers},
                              "display": sorted(answers)[0], "expires": now + 90}
                 await self.say(question + (" | أول إجابة صح تكسب نقطة! 🏆" if language == "ar" else " | First correct answer wins a point! 🏆"))
         elif cmd == "!joke":
@@ -393,7 +404,7 @@ class Social:
         elif NAMES.search(text) or cmd == "!ask" or self.followup(uid, text):
             addressed = bool(NAMES.search(text) or cmd == "!ask")
             answer = await self.ai(uid, arg if cmd == "!ask" else text)
-            if self.allowed(uid):
+            if self.allowed(uid) and (not quiet() or addressed):
                 await self.chat_say(answer)
                 self.remember_conversation(uid, text, addressed)
 

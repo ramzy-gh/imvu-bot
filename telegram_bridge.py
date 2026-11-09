@@ -17,7 +17,8 @@ from state_store import StateStore
 LOG = logging.getLogger("ramsei.telegram")
 ROOM = re.compile(r"[1-9]\d*-\d+")
 HELP = ("RAMSEI room bridge\nReply to a forwarded message to speak in that room.\n"
-        "/rooms — list connected rooms\n/say ROOM_ID message — send to a specific room\n"
+        "/rooms — room settings and music controls\n/control — open room controls\n"
+        "/cancel — cancel a settings or song input\n/say ROOM_ID message — send to a specific room\n"
         "/addviewer TELEGRAM_ID — grant read-only logs for all rooms\n"
         "/removeviewer TELEGRAM_ID — revoke access\n/viewers — list viewers\n"
         "Replies appear as normal messages sent by RAMSEI. Maximum 430 characters.")
@@ -47,6 +48,7 @@ class TelegramBridge:
         self.outbox = []
         self.routes = OrderedDict()
         self.names = OrderedDict()
+        self.room_names = {}
         self.viewers = {}
         self.viewer_queues = {}
         self.viewer_tasks = {}
@@ -55,6 +57,8 @@ class TelegramBridge:
         self.wake = asyncio.Event()
         self.save_lock = asyncio.Lock()
         self.dropped = 0
+        from telegram_controls import TelegramControls
+        self.controls = TelegramControls(self)
         try:
             self.tz = ZoneInfo(os.getenv("TELEGRAM_TIMEZONE", "Asia/Yekaterinburg"))
         except ZoneInfoNotFoundError:
@@ -94,7 +98,8 @@ class TelegramBridge:
                             or not isinstance(event.get("text"), str) or len(event["text"]) > 600
                             or type(event.get("id")) is not int or event["id"] <= 0
                             or not isinstance(event.get("at"), (int, float)) or not math.isfinite(event["at"])
-                            or not str(event.get("uid", "")).isdigit()):
+                            or not str(event.get("uid", "")).isdigit()
+                            or event.get("kind", "chat") not in {"chat", "joined", "left"}):
                         raise ValueError("Invalid Telegram outbox entry")
                 if len({event["id"] for event in self.outbox}) != len(self.outbox) or self.sequence < max(
                         (event["id"] for event in self.outbox), default=0):
@@ -123,6 +128,20 @@ class TelegramBridge:
         self.state = "starting"
         self.task = asyncio.create_task(self.run(), name="telegram-bridge")
 
+    async def remove_room(self, room):
+        self.outbox = [event for event in self.outbox if event["room"] != room]
+        self.routes = OrderedDict((message_id, target) for message_id, target in self.routes.items() if target != room)
+        self.room_names.pop(room, None)
+        self.controls.prompts = {key: prompt for key, prompt in self.controls.prompts.items() if prompt[1] != room}
+        self.controls.choices = {key: choice for key, choice in self.controls.choices.items() if choice[1] != room}
+        for queue in self.viewer_queues.values():
+            for _ in range(queue.qsize()):
+                item = queue.get_nowait()
+                if item[0] != room:
+                    queue.put_nowait(item)
+        if self.enabled:
+            await self.persist()
+
     def record(self, room, uid, text, username=None):
         if not self.enabled or not ROOM.fullmatch(str(room)) or not str(uid).isdigit():
             return
@@ -137,6 +156,14 @@ class TelegramBridge:
                             "at": time.time(), "name": username if isinstance(username, str)
                             and re.fullmatch(r"[A-Za-z0-9_]{1,40}", username) else None})
         self.wake.set()
+
+    def record_membership(self, room, uid, action):
+        if action not in {"joined", "left"}:
+            return
+        previous = self.sequence
+        self.record(room, uid, action)
+        if self.sequence != previous:
+            self.outbox[-1]["kind"] = action
 
     async def call(self, method, **payload):
         try:
@@ -158,6 +185,27 @@ class TelegramBridge:
         return await self.call("sendMessage", chat_id=int(uid), text=text,
                                link_preview_options={"is_disabled": True})
 
+    def room_header(self, room):
+        name = self.room_names.get(room, (0, "Unknown room"))[1]
+        return "[IMVU room - " + name + "]"
+
+    async def resolve_room_name(self, room):
+        cached = self.room_names.get(room)
+        if cached and time.monotonic() - cached[0] < 300:
+            return
+        entry = self.manager.rooms.get(room)
+        if not entry or not entry[0].session or entry[0].session.closed:
+            return
+        try:
+            path = "/room/room-" + room
+            result = await asyncio.wait_for(entry[0].api("GET", path), 3)
+            info = result.get("denormalized", {}).get("https://api.imvu.com" + path, {}).get("data", {})
+            name = info.get("name") or info.get("chat_name")
+            if self.manager.rooms.get(room) is entry and isinstance(name, str) and name.strip():
+                self.room_names[room] = (time.monotonic(), " ".join(name.split())[:200])
+        except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            pass
+
     def fanout(self, room, formatted):
         # The event sequence prevents newly approved viewers from receiving
         # older room messages that happen to remain in the owner's outbox.
@@ -173,12 +221,12 @@ class TelegramBridge:
             queue = self.viewer_queues[uid]
             if queue.full():
                 queue.get_nowait()  # A slow viewer never blocks the owner.
-            queue.put_nowait("[IMVU room " + room + "]\n" + "\n".join(lines))
+            queue.put_nowait((room, self.room_header(room) + "\n" + "\n".join(lines)))
 
     async def deliver_viewer(self, uid, generation, queue):
         lock = self.viewer_locks.setdefault(uid, asyncio.Lock())
         while True:
-            text = await queue.get()
+            _, text = await queue.get()
             try:
                 async with lock:
                     current = self.viewers.get(uid)
@@ -298,13 +346,18 @@ class TelegramBridge:
             await asyncio.sleep(.75)  # Batch a short burst from one room.
             try:
                 await self.persist()
+                if not self.outbox:
+                    continue
                 room = self.outbox[0]["room"]
-                lines, selected, formatted = ["[IMVU room " + room + "]"], [], []
+                await self.resolve_room_name(room)
+                lines, selected, formatted = [self.room_header(room)], [], []
                 for event in list(self.outbox):
                     if event["room"] != room:
                         continue
                     stamp = datetime.fromtimestamp(event["at"], self.tz).strftime("%H:%M:%S %Z")
-                    line = stamp + " " + await self.username(event) + ": " + event["text"]
+                    name = await self.username(event)
+                    kind = event.get("kind", "chat")
+                    line = stamp + " " + name + (" " + kind + " the room." if kind in {"joined", "left"} else ": " + event["text"])
                     if len("\n".join(lines)) + len(line) + 1 > 3500:
                         break
                     lines.append(line)
@@ -312,18 +365,23 @@ class TelegramBridge:
                     formatted.append((event["id"], line))
                     if len(selected) >= 8:
                         break
+                ids = frozenset(selected)
+                if not any(event["id"] in ids for event in self.outbox):
+                    continue
                 sent = await self.call("sendMessage", chat_id=self.owner, text="\n".join(lines),
                                        disable_notification=True, link_preview_options={"is_disabled": True})
                 message_id = sent["message_id"]
                 if type(message_id) is not int:
                     raise TelegramError()
+                if not any(event["id"] in ids for event in self.outbox):
+                    continue
                 self.routes[str(message_id)] = room
                 while len(self.routes) > 2000:
                     self.routes.popitem(last=False)
-                ids = frozenset(selected)
                 self.outbox = [event for event in self.outbox if event["id"] not in ids]
                 await self.persist()
-                self.fanout(room, formatted)
+                if self.routes.get(str(message_id)) == room:
+                    self.fanout(room, formatted)
                 self.state = "connected"
                 await asyncio.sleep(1.05)
             except (TelegramError, OSError) as error:
@@ -342,16 +400,13 @@ class TelegramBridge:
         if uid != self.owner:
             await self.non_owner(uid, command, sender)
             return
+        if await self.controls.message(message, command, text):
+            return
         if command in {"/addviewer", "/removeviewer", "/viewers"}:
             await self.viewer_command(command, text)
             return
         if command in {"/start", "/help"}:
             await self.notify(HELP)
-            return
-        if command == "/rooms":
-            await self.notify("Rooms:\n" + "\n".join(room + ": " +
-                ("connected" if bot.connected and bot.chat_ready else "reconnecting")
-                for room, (bot, _) in self.manager.rooms.items()))
             return
         if command == "/say":
             parts = text.split(maxsplit=2)
@@ -382,7 +437,7 @@ class TelegramBridge:
     async def poll(self):
         while True:
             try:
-                updates = await self.call("getUpdates", offset=self.offset, timeout=25, allowed_updates=["message"])
+                updates = await self.call("getUpdates", offset=self.offset, timeout=25, allowed_updates=["message", "callback_query"])
                 for update in updates:
                     update_id = update.get("update_id")
                     if type(update_id) is not int or update_id < (self.offset or 0):
@@ -393,6 +448,8 @@ class TelegramBridge:
                     await self.persist()
                     if isinstance(update.get("message"), dict):
                         await self.handle_message(update["message"])
+                    if isinstance(update.get("callback_query"), dict):
+                        await self.controls.callback(update["callback_query"])
             except (TelegramError, OSError) as error:
                 self.state = "polling_conflict" if isinstance(error, TelegramError) and error.code == 409 else "retrying"
                 LOG.warning("Telegram receiving delayed; no credential or message contents logged.")
@@ -416,6 +473,7 @@ class TelegramBridge:
                         self.offset = max((u["update_id"] + 1 for u in old), default=0)
                         await self.persist()
                     await self.notify(HELP)
+                    await self.controls.rooms()
                     self.state = "connected"
                     tasks = [asyncio.create_task(self.deliver()), asyncio.create_task(self.poll())]
                     await asyncio.gather(*tasks)

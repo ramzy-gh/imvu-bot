@@ -5,3 +5,7 @@ tests
 data
 *.json.tmp
 telegram-bridge.json
+
+# Виртуальное окружение — не копируем из хоста
+.venv/
+venv/

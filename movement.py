@@ -182,7 +182,7 @@ class Movement:
     async def move_near(self, uid):
         bot = self.bot
         async with self.lock:
-            if not bot.connected or not bot.chat_ready or uid not in bot.members or not bot.permissions.allowed(uid):
+            if not bot.connected or not bot.chat_ready or uid not in bot.members or not bot.permissions.allowed(uid, bot.room):
                 return None
             if time.monotonic() - self.last_move < 10:
                 return "Give me a moment before moving again."
@@ -197,7 +197,7 @@ class Movement:
                 return "I couldn't locate a valid spot near you in this room layout."
             # Recheck after loading assets: people can move or leave meanwhile.
             seats = participant_seats(await bot.api("GET", path), bot.room)
-            if uid not in bot.members or not bot.permissions.allowed(uid) or seats.get(uid) != target:
+            if uid not in bot.members or not bot.permissions.allowed(uid, bot.room) or seats.get(uid) != target:
                 return "You moved or left while I checked the seats. Try !move again."
             occupied = set(seats.values())
             candidates = sorted((seat for seat in positions if (fid, seat) not in occupied),
