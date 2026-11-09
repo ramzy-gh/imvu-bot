@@ -14,7 +14,7 @@ class SongChoices(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.blocked = set()
         self.radio = Radio()
-        self.bot = Bot(self.radio, permissions=SimpleNamespace(allowed=lambda uid: uid not in self.blocked))
+        self.bot = Bot(self.radio, permissions=SimpleNamespace(allowed=lambda uid, room: uid not in self.blocked))
         self.bot.members = {"1", "2"}
         self.bot.say = AsyncMock()
         self.choices = [{"title": "Song " + str(n), "url": f"https://www.youtube.com/watch?v=abcdefghij{n}"}

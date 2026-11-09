@@ -22,7 +22,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.room = "123-1"
         self.bot = SimpleNamespace(room=self.room, user_id="9", connected=True, chat_ready=True,
-                                   members={"1", "9"}, permissions=SimpleNamespace(allowed=lambda uid: True))
+                                   members={"1", "9"}, permissions=SimpleNamespace(allowed=lambda uid, room: True))
         self.mover = Movement(self.bot)
         self.bot.say = AsyncMock(return_value=True)
         self.positions = {30: (0, 0, 0), 31: (100, 0, 0), 8: (1, 0, 0), 7: (2, 0, 0)}
@@ -47,7 +47,7 @@ class MovementTests(unittest.IsolatedAsyncioTestCase):
         snapshot = seats(self.room, [("1", 0, 30), ("9", 0, 31), ("2", 0, 8), ("3", 0, 7)])
         self.bot.api = AsyncMock(return_value=snapshot)
         self.assertIn("isn't a free spot", await self.mover.move_near("1"))
-        self.bot.permissions.allowed = lambda uid: False
+        self.bot.permissions.allowed = lambda uid, room: False
         self.bot.api.reset_mock()
         self.assertIsNone(await self.mover.move_near("1"))
         self.bot.api.assert_not_awaited()

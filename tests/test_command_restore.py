@@ -15,6 +15,8 @@ class CommandRestoreTests(unittest.IsolatedAsyncioTestCase):
         permissions.admins=set()
         permissions.blocked=set()
         permissions.room_admins=set()
+        permissions.owner_blocked=set()
+        permissions.moderation.return_value=({'123'}, set())
         permissions.names={}
         permissions.allowed.return_value=True
         permissions.authorization_error.return_value=None
@@ -26,6 +28,7 @@ class CommandRestoreTests(unittest.IsolatedAsyncioTestCase):
         bot.user_id='9'
         bot.queue='room/test'
         bot.packet=AsyncMock(return_value=7)
+        bot.api=AsyncMock(return_value={})
         bot.speech.render=AsyncMock(side_effect=AssertionError('Commands must never translate'))
         return bot
 

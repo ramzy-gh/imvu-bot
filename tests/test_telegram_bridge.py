@@ -159,7 +159,7 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.dropped, 1)
 
     async def test_public_chat_is_relayed_even_when_sender_is_blocked_from_features(self):
-        bot = Bot(Radio(), room="123-1", permissions=SimpleNamespace(allowed=lambda uid: False),
+        bot = Bot(Radio(), room="123-1", permissions=SimpleNamespace(allowed=lambda uid, room: False),
                   room_manager=SimpleNamespace(telegram=self.bridge))
         bot.user_id, bot.queue, bot.members, bot.chat_ready = "9", "q", {"1"}, True
         packet = {"record": "msg_g2c_send_message", "queue": "q", "mount": "messages", "user_id": "1",

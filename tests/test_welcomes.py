@@ -9,7 +9,7 @@ from bot import API, Bot, Radio
 
 class WelcomeTests(unittest.IsolatedAsyncioTestCase):
     def bot(self, room="123-1"):
-        bot = Bot(Radio(), room=room, permissions=SimpleNamespace(allowed=lambda uid: True))
+        bot = Bot(Radio(), room=room, permissions=SimpleNamespace(allowed=lambda uid, room: True))
         bot.user_id = "9"
         bot.connected = bot.chat_ready = True
         bot.say = AsyncMock(return_value=True)
@@ -76,7 +76,7 @@ class WelcomeTests(unittest.IsolatedAsyncioTestCase):
         bot.occupants.remove("new")
         await bot.participants(greet=True)
         bot.say.assert_not_awaited()
-        bot.permissions.allowed = lambda uid: False
+        bot.permissions.allowed = lambda uid, room: False
         bot.occupants.add("blocked")
         await bot.participants(greet=True)
         bot.say.assert_not_awaited()

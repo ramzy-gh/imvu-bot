@@ -12,10 +12,11 @@ from room_control import RoomManager
 
 class LanguageTests(unittest.IsolatedAsyncioTestCase):
     def permission(self):
-        p = Permissions.__new__(Permissions)
-        p.blocked = set()
+        with patch("permissions.StateStore") as store:
+            store.return_value.load.return_value = None
+            p = Permissions(default_room="1-1")
         p.room_admins = {'12345'}
-        p.admins = {'54321'}
+        p.admins.add('54321')
         return p
 
     def test_aliases_and_validation(self):

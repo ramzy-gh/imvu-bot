@@ -89,8 +89,9 @@ class MusicFallback(unittest.IsolatedAsyncioTestCase):
 
     async def test_fallback_offers_choices_without_queuing_unselected_audio(self):
         bot = Bot.__new__(Bot)
+        bot.room = "1-1"
         bot.members = {'1'}
-        bot.permissions = SimpleNamespace(allowed=lambda uid: True)
+        bot.permissions = SimpleNamespace(allowed=lambda uid, room: True)
         bot.song_choices = OrderedDict({'1': (time.monotonic() + 120,
             [{'title': 'Original song (Official video)', 'search_query': 'artist song', 'url': 'https://www.youtube.com/watch?v=abcdefghijk'}])})
         bot.say = AsyncMock()
