@@ -123,7 +123,7 @@ class Permissions:
             return "لازم أتأكد من هوية الحساب من السيرفر الأول 🔒"
         if not self.allowed(actor, room):
             return "This account is blocked from using the bot."
-        if command in OWNER_COMMANDS:
+        if command in OWNER_COMMANDS or command == "!language":
             return None if actor == OWNER_ID else "Only owner @Ramzy can use this command."
         if command in ROOM_COMMANDS:
             return None if actor == OWNER_ID or actor in self.room_admins else "Room controls require access granted by owner @Ramzy."
