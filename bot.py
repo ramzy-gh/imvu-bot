@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 from personality import ALIASES, Social
-from permissions import OWNER_ID, Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normalize_management_message
+from permissions import OWNER_ID, Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normalize_management_message, canonical_management_command
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
 from wardrobe import load_named_outfit, OutfitError
@@ -1118,17 +1118,41 @@ class Bot:
                     self.social.inbox.put_nowait((uid, text))
 
     async def management_command(self, uid, verified, cmd, query):
-        error = self.permissions.authorization_error(uid, verified, cmd, self.room)
+        cmd = canonical_management_command(cmd)
+        target_room = self.room
+        if cmd in {"!addadmin", "!removeadmin", "!admins"}:
+            args = query.split()
+            listing = cmd == "!admins"
+            if (listing and len(args) > 1) or (not listing and len(args) not in (1, 2)):
+                await self.say("Usage: !admins [ROOM_ID]" if listing else f"Usage: {cmd} Username [ROOM_ID]")
+                return
+            if (listing and args) or (not listing and len(args) == 2):
+                target_room = args[-1]
+                if not re.fullmatch(r"[1-9]\d*-\d+", target_room):
+                    await self.say("Use a numeric room ID such as 330286535-177.")
+                    return
+            query = "" if listing else args[0]
+            if target_room != self.room:
+                if not verified or not self.permissions.is_mod(uid):
+                    await self.say("Only @Ramzy and Mods can manage admins in another room.")
+                    return
+                manager = self.room_manager
+                known_rooms = (set(getattr(manager, "desired_rooms", ())) |
+                               set(getattr(manager, "rooms", ())) | {self.room})
+                if target_room not in known_rooms:
+                    await self.say("That room is not saved for this bot. Use !rooms to see the room IDs.")
+                    return
+        error = self.permissions.authorization_error(uid, verified, cmd, target_room)
         if error:
             await self.say(error)
             return
         if cmd == "!owneronly":
             await self.say(await asyncio.to_thread(self.permissions.manage, uid, verified, cmd, query, room=self.room))
             return
-        if cmd in {"!admins", "!blocked", "!roomadmins", "!ownerblocked"}:
-            admins, blocked = self.permissions.moderation(self.room)
+        if cmd in {"!admins", "!blocked", "!mods", "!ownerblocked"}:
+            admins, blocked = self.permissions.moderation(target_room)
             ids = {"!admins": admins, "!blocked": blocked,
-                   "!roomadmins": self.permissions.room_admins, "!ownerblocked": self.permissions.owner_blocked}[cmd]
+                   "!mods": self.permissions.mods, "!ownerblocked": self.permissions.owner_blocked}[cmd]
             for target in sorted(ids)[:12]:
                 try:
                     data = await self.api("GET", f"/user/user-{target}")
@@ -1138,14 +1162,14 @@ class Bot:
                         self.permissions.names[target] = name
                 except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
                     pass  # Fall back to saved usernames when lookup is unavailable.
-            await self.say(self.permissions.manage(uid, verified, cmd, room=self.room))
+            await self.say(self.permissions.manage(uid, verified, cmd, room=target_room))
             return
         try:
             target, username = await resolve_username(self.api, query)
         except UserLookupError as error:
             await self.say(str(error))
             return
-        await self.say(await asyncio.to_thread(self.permissions.manage, uid, verified, cmd, target, username=username, room=self.room))
+        await self.say(await asyncio.to_thread(self.permissions.manage, uid, verified, cmd, target, username=username, room=target_room))
 
     @staticmethod
     def is_song_number(text):
@@ -1306,8 +1330,10 @@ class Bot:
                     await self.say("Music search: !play <song or artist>, then reply 1-10 to choose. A YouTube link queues directly.")
                     if self.permissions.authorization_error(uid, verified, "!rooms", self.room) is None:
                         await self.say("Room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
-                    if self.permissions.authorization_error(uid, verified, "!addroomadmin", self.room) is None:
-                        await self.say("Owner: !ownerblock Username | !ownerunblock Username | !ownerblocked | !owneronly on/off. !language ar-eg | !language en | !language ru | !language auto (this room only). !addroomadmin Username | !removeroomadmin Username | !roomadmins.")
+                    if self.permissions.authorization_error(uid, verified, "!addadmin", self.room) is None:
+                        await self.say("Admin management: !addadmin Username [ROOM_ID] | !removeadmin Username [ROOM_ID] | !admins [ROOM_ID]. Omit ROOM_ID for this room. !mods lists global Mods.")
+                    if self.permissions.authorization_error(uid, verified, "!addmod", self.room) is None:
+                        await self.say("Owner: !addmod Username | !removemod Username | !mods. !ownerblock Username | !ownerunblock Username | !ownerblocked | !owneronly on/off. !language ar-eg | en | ru | auto (this room only).")
             except MusicLookupError as error:
                 LOG.warning("Music command failed: reason=%s", error.reason)
                 with contextlib.suppress(Exception):

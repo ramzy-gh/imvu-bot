@@ -1,5 +1,21 @@
 # RAMSEI room companion — experimental Bothost build
 
+## Private-message room invitations
+
+Send Ramsei a new one-to-one IMVU message with `!invite ROOM_ID`,
+`!invite Exact Room Name`, or `!invite https://www.imvu.com/next/chat/room-OWNER-NUMBER/`.
+Ramsei must already be connected to that room. Names are case-insensitive;
+duplicate room names require an ID. Requests are checked about every 10 seconds.
+The bot sends the normal IMVU room invitation even when the room reports 10/10;
+IMVU controls admission, room permissions, and capacity. Accepting an invitation
+and entering a full room still require a live client test.
+
+Only new messages addressed to this account are processed. Old commands are
+not replayed after restart, group conversations are excluded, blocked users
+are ignored, and requests are limited to one per user every 30 seconds and
+20 total per minute. Message content is not relayed to Telegram or AI.
+Whispers between other people are not intercepted.
+
 Configured account: **Ramsei**. Room: **330286535-177**.
 Bot owner: **Ramzy**, numeric IMVU ID **214900673**.
 
@@ -26,7 +42,7 @@ on the server; people can use Classic to chat in the room.
   are sent to the selected AI provider. Ordinary room chat is not sent to the AI.
 - Riddles, trivia, number guessing, jokes, light challenges, playful fortunes.
 - Games and scores are held in memory and reset on restart.
-- Arabic and English music search; up to ten numbered choices, queue, MP3 radio.
+- Arabic and English music search; first YouTube search match, queue, MP3 radio.
 - Cooldowns, queue limits, bounded listener buffers, bounded AI history and
   a default cap of 60 AI calls per hour. That cap is not a billing guarantee.
 - No automatic ambient chatter: it responds to mentions, commands and game answers.
@@ -79,7 +95,7 @@ Example messages:
 | `ADMIN_IDS` | Leave empty; optional first-start admin seed only |
 | `AI_PROVIDER` | `groq` (default), or `gemini` |
 | `GROQ_API_KEY` | Your private Groq API key when using Groq |
-| `GROQ_MODEL` | `openai/gpt-oss-120b` by default |
+| `GROQ_MODEL` | `openai/gpt-oss-20b` by default |
 | `GEMINI_API_KEY` | Optional: your private Google AI Studio API key |
 | `GEMINI_MODEL` | `gemini-flash-latest`, or an available text model for your key |
 | `AI_MAX_CALLS_PER_HOUR` | `60` |
@@ -122,7 +138,7 @@ will be lost on container replacement.
 
 When configured, the app creates `ramsei_state` and stores the login session and
 permission lists there. The database user needs permission to create that table
-and read/write its rows. Connections require TLS by default. An explicit sslmode in the private connection URL selects the provider-supported mode. Keep the URL private, keep
+and read/write its rows. Connections require TLS. Keep the URL private, keep
 `STATE_NAMESPACE` unchanged, and run one active bot per namespace. A distinct bot
 should use a distinct namespace. Use an external database with durable storage,
 not one running inside this same ephemeral Bothost container.
@@ -226,15 +242,15 @@ chat unless an admin has blocked their account from the bot.
 
 | Command | Who can use it | Effect |
 | --- | --- | --- |
-| `!addadmin Username` | Ramzy only | Promote that account to bot admin |
-| `!removeadmin Username` | Owner only | Remove bot admin role |
-| `!admins` | Owner/admins | Show owner and admin usernames |
+| `!addadmin Username [ROOM_ID]` | Owner/Mods | Add an admin in the current or specified saved room |
+| `!removeadmin Username [ROOM_ID]` | Owner/Mods | Remove an admin from that room only |
+| `!admins [ROOM_ID]` | Owner/Mods; local admins in their current room | List admins for one room |
 | `!block Username` | Owner/admins | Block a regular account from bot commands, games and AI replies |
 | `!unblock Username` | Owner/admins | Restore access to the bot |
 | `!blocked` | Owner/admins | Show blocked usernames |
-| `!addroomadmin Username` | Ramzy only | Grant room-control access |
-| `!removeroomadmin Username` | Ramzy only | Revoke room-control access |
-| `!roomadmins` | Ramzy only | List accounts with room-control access |
+| `!addmod Username` | Ramzy only | Grant the global Mod role |
+| `!removemod Username` | Ramzy only | Revoke the global Mod role |
+| `!mods` | Owner/Mods | List global Mods |
 
 These blocks apply only to this bot; they do not kick someone from the room or
 prevent normal chat. Blocked accounts are not greeted. Admins cannot block the owner or other
@@ -344,24 +360,31 @@ private bridge state; it will not forward old logs to a different account.
 
 ### Owner controls from room chat
 
-The verified owner account **Ramzy (214900673)** and accounts explicitly granted
-room-control access can use these commands. Regular admin status alone does not
+The verified owner account **Ramzy (214900673)** and global **Mods** can use
+these room commands. Regular room-admin status alone does not
 grant room control. Send commands from any room the bot has already joined:
 
-Only Ramzy can grant, revoke or list room-control access, using account usernames:
+Only Ramzy can grant or revoke Mods, using account usernames. Owner and Mods can list Mods:
 
 ```text
-!addroomadmin C4MU
-!removeroomadmin C4MU
-!roomadmins
+!addmod C4MU
+!removemod C4MU
+!mods
 ```
 
-Access applies across all the bot's rooms and survives restarts. It permits
-`!join`, `!leave`, `!rooms` and `!mainroom`; it does not grant regular admin powers
-or permission to delegate access. Revocation takes effect for subsequent commands
-in every room. Blocking a delegate suspends use of room controls while blocked.
-Unblock an account before granting it room-control access. The owner retains
-permanent access, and the main room remains protected for everyone.
+Mods apply across all rooms and survive restarts. They can use `!join`, `!leave`,
+`!rooms` and `!mainroom`, and add/remove/list room admins in any saved room.
+Use `!addadmin Username ROOM_ID`, `!removeadmin Username ROOM_ID` or `!admins ROOM_ID`
+from any joined room. Omit ROOM_ID for the current room. Grants remain room-specific.
+Mods cannot grant/revoke Mods or use owner-only commands. Only the fixed owner ID
+can do that. Revocation is rechecked when each permission change is saved.
+Room admins cannot block Mods; owner blocks and owner-only mode still override Mods.
+Removing a Mod preserves any separately granted local admin roles.
+
+Existing `room_admins` entries load as Mods without changing their account IDs or
+room-specific admin/block lists. Saved data includes a canonical `mods` field and
+a legacy mirror for rollback. Old `!addroomadmin`, `!removeroomadmin` and `!roomadmins`
+commands remain aliases; new help uses the Mod names. The main room stays protected.
 
 ```text
 !join 47377071-5395
@@ -494,25 +517,21 @@ version after the live test if reproducible builds are needed.
 No external code is downloaded or executed on your behalf by this ZIP until you
 deploy it. Dependencies are installed from their normal repositories during the build.
 
-## Owner-only room language
+### Telegram room controls
 
-The verified IMVU bot owner can set the language inside each room. Admins and room-control delegates cannot change it.
+The Telegram owner can send `/rooms`, `/control`, or `/settings` and select a room by name. Viewers remain read-only. Buttons always target the room shown on that panel.
 
-| Command | Result in this room |
-| --- | --- |
-| !language ar-eg | Egyptian Arabic conversational replies |
-| !language en | English only |
-| !language ru | Russian |
-| !language fr | French |
-| !language auto | Automatic language matching |
-| !language | Show the current setting |
+- Quiet ON keeps explicit mentions and commands working, suppresses automatic conversational follow-ups, and leaves music and Telegram logs running. Quiet OFF restores normal behavior.
+- Language uses the existing per-room output language setting, including automatic, English, Egyptian Arabic, Russian, or another language code.
+- Welcomes can be enabled or disabled separately. Existing greetings remain the default. Only the Telegram owner can set/reset a room's custom welcome; `{name}` expands to the visitor's username and `{room}` to its room name. Custom text is limited to 300 characters.
+- Music offers search and song selection, direct YouTube/SoundCloud links, current track and queue, skip, and stop/clear. Each room retains a separate queue.
+- Reply directly to the bot's settings/song prompt within ten minutes; `/cancel` cancels input. Pending input is intentionally cleared on restart. Saved room preferences and languages survive restarts through StateStore.
+- Join and leave events share the existing owner/viewer logs and room reply routing. Membership is sampled about every five seconds; visits entirely between samples may be missed. Initial connection/reconnection establishes a baseline without reporting everyone as newly joined.
 
-Arabic alias: !اللغة عربي. Other languages use ISO/BCP-47 codes. Translation quality depends on the model and is not equally reliable for every language. URLs remain functional machine-readable links rather than translated prose.
+Welcome controls: Quiet mode only affects conversation. The Welcomes ON/OFF switch independently controls arrival greetings. Restore default welcome clears the custom message and enables welcomes in that room. Saving a custom welcome also enables welcomes. Both changes are persisted atomically.
 
-Language choices use a separate room-languages state record under the existing namespace and survive restart. Existing rooms start in automatic mode. Permissions and the room list are unchanged. Save failures keep the previous choice.
 
-Strict language applies to conversational AI replies. Commands, help, admin lists, music titles and game output are sent directly without translation. Welcomes include the joining avatar username and the actual title of that same room; names are preserved exactly. Arabic and Russian rooms have native welcome templates, with an English default for other settings. AI or translation outages suppress the failed conversational reply and use retry backoff rather than repeating an unavailable notice. Conversation translations use the existing Groq key, bounded caching, and at most 120 attempts per room per hour, in addition to the existing conversation cap.
-
-## Natural follow-up conversations
-
-Mention Ramsei or use !ask to start. The same participant can then send up to four follow-up turns without repeating the name, while each gap stays under 90 seconds. This applies to general short messages and questions, rather than specific trigger phrases, in Arabic, English and other configured languages. Context is isolated by person and room. Commands, messages directed at another @account, blocked users and expired conversations do not activate follow-up replies. Asking it to stop clears the conversation window. It remains openly an AI companion.
+Owner protections:
+- !ownerblock Username blocks any account, including admins. Only the owner can remove it with !ownerunblock Username. !ownerblocked lists these blocks. Ordinary unblock and admin grants cannot override them.
+- Tracks requested by the owner through chat or the private Telegram music panel can only be skipped/stopped by the owner while playing.
+- !owneronly on disables bot use for everyone except the owner across all rooms. !owneronly off restores normal permissions. This setting and owner blocks survive restarts.

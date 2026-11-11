@@ -15,7 +15,7 @@ class Permissions:
         self.path = Path(os.getenv("PERMISSIONS_PATH", "/app/data/ramsei/permissions.json"))
         self.default_room = default_room or os.getenv("IMVU_ROOM_ID", "330286535-177").strip()
         self.admins = set()
-        self.room_admins = set()
+        self.mods = set()
         self.blocked = set()
         self.room_moderation = {}
         self.owner_blocked = set()
@@ -29,7 +29,8 @@ class Permissions:
         if data is not None:
             try:
                 self.admins = self.ids(data["admins"])
-                self.room_admins = self.ids(data.get("room_admins", []))
+                # A canonical field prevents stale legacy data restoring revoked grants.
+                self.mods = self.ids(data.get("mods", data.get("room_admins", [])))
                 self.blocked = self.ids(data["blocked"])
                 for room, roles in data.get("room_moderation", {}).items():
                     if not re.fullmatch(r"[1-9]\d*-\d+", room) or not isinstance(roles, dict):
@@ -61,7 +62,7 @@ class Permissions:
         for admins, blocked in self.room_moderation.values():
             admins.discard(OWNER_ID)
             blocked.difference_update(admins | {OWNER_ID})
-        self.room_admins.discard(OWNER_ID)
+        self.mods.discard(OWNER_ID)
         self.names[OWNER_ID] = OWNER_NAME
         if data is None:
             try:
@@ -78,6 +79,18 @@ class Permissions:
     def moderation(self, room=None):
         return self.room_moderation.get(room or self.default_room, (frozenset(), frozenset()))
 
+    @property
+    def room_admins(self):
+        """Compatibility alias for the global Mods set."""
+        return self.mods
+
+    @room_admins.setter
+    def room_admins(self, values):
+        self.mods = values
+
+    def is_mod(self, uid):
+        return str(uid) == OWNER_ID or str(uid) in self.mods
+
     def is_admin(self, uid, room=None):
         return str(uid) == OWNER_ID or str(uid) in self.moderation(room)[0]
 
@@ -85,10 +98,10 @@ class Permissions:
         return str(uid) == OWNER_ID or (not self.owner_only and str(uid) not in self.owner_blocked)
 
     def allowed(self, uid, room=None):
-        return self.globally_allowed(uid) and str(uid) not in self.moderation(room)[1]
+        return self.globally_allowed(uid) and (self.is_mod(uid) or str(uid) not in self.moderation(room)[1])
 
     def _relevant_ids(self):
-        relevant = self.room_admins | self.owner_blocked | {OWNER_ID}
+        relevant = self.mods | self.owner_blocked | {OWNER_ID}
         for admins, blocked in self.room_moderation.values():
             relevant.update(admins | blocked)
         return relevant
@@ -98,7 +111,8 @@ class Permissions:
         self.store.save({"admins": [], "blocked": [],
             "room_moderation": {room: {"admins": sorted(admins), "blocked": sorted(blocked)}
                                 for room, (admins, blocked) in self.room_moderation.items() if admins or blocked},
-            "room_admins": sorted(self.room_admins),
+            "mods": sorted(self.mods),
+            "room_admins": sorted(self.mods),  # Preserve rollback compatibility.
             "owner_blocked": sorted(self.owner_blocked), "owner_only": self.owner_only,
             "usernames": {uid: name for uid, name in self.names.items() if uid in relevant}})
 
@@ -119,6 +133,7 @@ class Permissions:
 
     def authorization_error(self, actor, verified, command, room=None):
         actor = str(actor)
+        command = canonical_management_command(command)
         if not verified:
             return "لازم أتأكد من هوية الحساب من السيرفر الأول 🔒"
         if not self.allowed(actor, room):
@@ -126,13 +141,16 @@ class Permissions:
         if command in OWNER_COMMANDS or command == "!language":
             return None if actor == OWNER_ID else "Only owner @Ramzy can use this command."
         if command in ROOM_COMMANDS:
-            return None if actor == OWNER_ID or actor in self.room_admins else "Room controls require access granted by owner @Ramzy."
-        if command in {"!addroomadmin", "!removeroomadmin", "!roomadmins"}:
-            return None if actor == OWNER_ID else "Only owner @Ramzy can grant, revoke or list room-control access."
+            return None if self.is_mod(actor) else "Room controls require the Mod role granted by owner @Ramzy."
+        if command in {"!addmod", "!removemod"}:
+            return None if actor == OWNER_ID else "Only owner @Ramzy can add or remove Mods."
+        if command == "!mods":
+            return None if self.is_mod(actor) else "Only owner @Ramzy and Mods can list Mods."
         if command in {"!addadmin", "!removeadmin"}:
-            if actor != OWNER_ID:
-                return "إضافة وحذف الأدمنز لرامزي صاحب البوت بس 👑"
-        elif not self.is_admin(actor, room):
+            return None if self.is_mod(actor) else "Only owner @Ramzy and Mods can add or remove room admins."
+        if command == "!admins" and self.is_mod(actor):
+            return None
+        if not self.is_admin(actor, room):
             return "الأمر ده للأدمنز بس يا نجم 🛡️"
         return None
 
@@ -146,6 +164,7 @@ class Permissions:
 
     def _manage(self, actor, verified, command, target, username, room):
         """IDs authorize internally; all user-facing output uses usernames."""
+        command = canonical_management_command(command)
         error = self.authorization_error(actor, verified, command, room)
         if error:
             return error
@@ -164,13 +183,13 @@ class Permissions:
             return "Owner-blocked: " + (", ".join(self.label(uid) for uid in sorted(self.owner_blocked)[:12]) or "none")
         if command == "!admins":
             names = [self.label(uid) for uid in sorted(self.moderation(room)[0])[:12]]
-            return "👑 Owner: @Ramzy | 🛡️ Room admins: " + (", ".join(names) or "none")
+            return "Owner: @Ramzy | Room " + (room or self.default_room) + " admins: " + (", ".join(names) or "none")
         if command == "!blocked":
             names = [self.label(uid) for uid in sorted(self.moderation(room)[1])[:12]]
             return "🚫 Blocked in this room: " + (", ".join(names) or "none")
-        if command == "!roomadmins":
-            names = [self.label(uid) for uid in sorted(self.room_admins)[:12]]
-            return "Room-control access: " + (", ".join(names) or "none") + " | Owner: @Ramzy"
+        if command == "!mods":
+            names = [self.label(uid) for uid in sorted(self.mods)[:12]]
+            return "Mods (all rooms): " + (", ".join(names) or "none") + " | Owner: @Ramzy"
         if not re.fullmatch(r"[1-9]\d*", target):
             return f"اكتب اسم الحساب بعد الأمر، مثال: {command} Username 🔎"
         if target == OWNER_ID:
@@ -178,11 +197,13 @@ class Permissions:
         admins, blocked = self.room_moderation.setdefault(room or self.default_room, (set(), set()))
         if command == "!block" and target in admins:
             return "مينفعش تمنع أدمن. صاحب البوت يشيل رتبته الأول 🛡️"
-        if command == "!addroomadmin" and target in blocked:
-            return "That account is blocked. Use !unblock Username before granting room-control access."
-        if target in self.owner_blocked and command in {"!unblock", "!addadmin", "!addroomadmin"}:
+        if command == "!block" and target in self.mods:
+            return "Mods cannot be room-blocked. Only @Ramzy can use !ownerblock Username."
+        if command == "!addmod" and target in blocked:
+            return "That account is blocked. Use !unblock Username before granting Mod access."
+        if target in self.owner_blocked and command in {"!unblock", "!addadmin", "!addmod"}:
             return "This account is owner-blocked. Only @Ramzy can use !ownerunblock Username."
-        before = self.owner_blocked.copy(), admins.copy(), self.room_admins.copy(), blocked.copy(), self.names.copy()
+        before = self.owner_blocked.copy(), admins.copy(), self.mods.copy(), blocked.copy(), self.names.copy()
         if username is not None:
             if not isinstance(username, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,40}", username):
                 return "اسم الحساب غير صالح 🔎"
@@ -197,28 +218,28 @@ class Permissions:
         elif command == "!addadmin":
             admins.add(target)
             blocked.discard(target)
-            reply = f"تمت إضافة {label} كأدمن 🛡️✅"
+            reply = f"Added {label} as admin in room {room or self.default_room}."
         elif command == "!removeadmin":
             admins.discard(target)
-            reply = f"تم حذف رتبة الأدمن من {label} ✅"
+            reply = f"Removed admin access from {label} in room {room or self.default_room}."
         elif command == "!block":
             blocked.add(target)
             reply = f"تم منع {label} من استخدام أوامر البوت 🚫"
         elif command == "!unblock":
             blocked.discard(target)
             reply = f"تم السماح لـ {label} باستخدام البوت تاني ✅"
-        elif command == "!addroomadmin":
-            self.room_admins.add(target)
-            reply = f"Granted room-control access to {label}: !join, !leave, !rooms and !mainroom."
-        elif command == "!removeroomadmin":
-            self.room_admins.discard(target)
-            reply = f"Removed room-control access from {label}."
+        elif command == "!addmod":
+            self.mods.add(target)
+            reply = f"Added Mod {label}: room invitations and room-admin management in all rooms."
+        elif command == "!removemod":
+            self.mods.discard(target)
+            reply = f"Removed the global Mod role from {label}. Existing room-admin roles remain."
         else:
             return "Unknown management command"
         try:
             self.save()
         except OSError:
-            self.owner_blocked, old_admins, self.room_admins, old_blocked, self.names = before
+            self.owner_blocked, old_admins, self.mods, old_blocked, self.names = before
             admins.clear()
             admins.update(old_admins)
             blocked.clear()
@@ -228,14 +249,19 @@ class Permissions:
 
 
 OWNER_COMMANDS = {"!ownerblock", "!ownerunblock", "!ownerblocked", "!owneronly"}
+MOD_ALIASES = {"!addroomadmin": "!addmod", "!removeroomadmin": "!removemod", "!roomadmins": "!mods"}
 MANAGEMENT_COMMANDS = OWNER_COMMANDS | {"!addadmin", "!removeadmin", "!admins", "!block", "!unblock", "!blocked",
-                       "!addroomadmin", "!removeroomadmin", "!roomadmins"}
+                       "!addmod", "!removemod", "!mods"} | set(MOD_ALIASES)
 ROOM_COMMANDS = {"!join", "!leave", "!rooms", "!mainroom"}
+
+
+def canonical_management_command(command):
+    return MOD_ALIASES.get(command, command)
 
 
 def normalize_management_message(text):
     """Allow / management commands if the client transmits them as chat."""
     parts = text.strip().split(maxsplit=1)
-    if parts and parts[0].startswith("/") and "!" + parts[0][1:].lower() in MANAGEMENT_COMMANDS | ROOM_COMMANDS:
-        return "!" + parts[0][1:].lower() + (" " + parts[1] if len(parts) > 1 else "")
+    if parts and parts[0].startswith(("/", "!")) and "!" + parts[0][1:].lower() in MANAGEMENT_COMMANDS | ROOM_COMMANDS:
+        return canonical_management_command("!" + parts[0][1:].lower()) + (" " + parts[1] if len(parts) > 1 else "")
     return text
