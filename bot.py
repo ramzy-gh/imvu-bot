@@ -1,4 +1,4 @@
-"""RAMSEI v11: named wardrobe outfit Bot, AI fallback, and English welcomes."""
+"""RAMSEI v12: recoverable music workers and continuous per-room radio."""
 import asyncio
 import base64
 import contextlib
@@ -25,6 +25,21 @@ from movement import Movement, legacy_seat_message
 LOG = logging.getLogger("ramsei")
 API = "https://api.imvu.com"
 IMQ = "wss://wss-imq.imvu.com/streaming/imvu_pre"
+
+
+async def supervise(factory, label, delay=5):
+    """Restart only a failed worker; cancellation always means shutdown."""
+    while True:
+        try:
+            await factory()
+            LOG.warning("Worker %s exited; restarting in %ss", label, delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # Exceptions can contain credentials or signed audio URLs.
+            LOG.warning("Worker %s failed: type=%s; restarting in %ss",
+                        label, type(error).__name__, delay)
+        await asyncio.sleep(delay)
 
 
 class AuthenticationRequired(RuntimeError):
@@ -173,11 +188,16 @@ async def capture(*args, timeout=60):
         return out
     finally:
         if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await asyncio.wait_for(proc.communicate(), 5)
 
 
 class Radio:
+    IO_TIMEOUT = 20
+    LOOKUP_TIMEOUT = 85
+    RECOVERY_DELAY = 2
+
     def __init__(self):
         self.queue = asyncio.Queue(maxsize=30)
         self.listeners = set()
@@ -195,6 +215,8 @@ class Radio:
         self.listener_resyncs = 0
         self.source_retries = 0
         self.youtube_blocked_until = 0
+        self.last_frame_at = None
+        self.recoveries = 0
 
     @staticmethod
     def lookup_target(query):
@@ -376,6 +398,7 @@ class Radio:
 
     async def broadcast(self, chunk):
         if chunk is not None:
+            self.last_frame_at = time.monotonic()
             self.bytes_sent += len(chunk)
             self.recent_frames.append(chunk)
         for listener in tuple(self.listeners):
@@ -433,7 +456,7 @@ class Radio:
             except asyncio.TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
-                await proc.communicate()
+                await asyncio.wait_for(proc.communicate(), 3)
 
     async def produce_pcm(self, announce):
         """Decode each song; the encoder continues receiving silence during gaps."""
@@ -448,24 +471,30 @@ class Radio:
             try:
                 self.track_starts += 1
                 stop_task = asyncio.create_task(self.skip.wait())
-                with contextlib.suppress(ConnectionError, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError):
-                    await announce("Now playing: " + track["title"])
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(announce("Now playing: " + track["title"]), 10)
                 await self.decode_track(track, stop_task)
                 # Decoding runs ahead of playback. Keep the song active until
                 # its final queued samples reach the continuous encoder.
                 await self.pcm.join()
-            except (OSError, ValueError):
-                self.last_error = "Audio decoder could not start; check FFmpeg and the song source."
-                LOG.warning(self.last_error)
+            except Exception as error:
+                self.last_error = "Song failed; the next queued song will be tried automatically."
+                LOG.warning("Audio track failed: type=%s; continuing queue", type(error).__name__)
+            else:
+                if self.last_error:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(announce("This song source failed after retries. Try another result; the radio is still running."), 10)
             finally:
                 if stop_task:
                     stop_task.cancel()
                     await asyncio.gather(stop_task, return_exceptions=True)
-                await self.stop_process(self.proc)
-                self.proc = None
-                self.current = None
-                self.idle = True
-                self.queue.task_done()
+                try:
+                    await self.stop_process(self.proc)
+                finally:
+                    self.proc = None
+                    self.current = None
+                    self.idle = True
+                    self.queue.task_done()
 
     async def decode_track(self, track, stop_task):
         """Resume truncated sources at the number of PCM samples already queued."""
@@ -496,7 +525,7 @@ class Radio:
                         await self.pcm.put(chunk.ljust(17640, b"\0"))
                         decoded_bytes += len(chunk)
                     if ended:
-                        await self.proc.wait()
+                        await asyncio.wait_for(self.proc.wait(), self.IO_TIMEOUT)
                         break
             finally:
                 if read_task:
@@ -523,9 +552,12 @@ class Radio:
             if track.get("source"):
                 refresh = asyncio.create_task(self.lookup(track["source"]))
                 try:
-                    done, _ = await asyncio.wait({refresh, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+                    done, _ = await asyncio.wait({refresh, stop_task}, timeout=self.LOOKUP_TIMEOUT,
+                                                 return_when=asyncio.FIRST_COMPLETED)
                     if self.skip.is_set():
                         return
+                    if refresh not in done:
+                        raise asyncio.TimeoutError
                     track = dict(track, url=refresh.result()["url"])
                 except (RuntimeError, ValueError, OSError, asyncio.TimeoutError):
                     pass  # The original URL may still recover on the next attempt.
@@ -539,6 +571,16 @@ class Radio:
                 pass
 
     async def run(self, announce):
+        # Keep the song producer alive while replacing a broken encoder. Its
+        # bounded PCM queue pauses decoding until the replacement consumes it.
+        producer = asyncio.create_task(supervise(lambda: self.produce_pcm(announce), "audio-producer"))
+        try:
+            await self.encode_forever()
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    async def encode_forever(self):
         """One continuous MP3 encoder per room, across all tracks and idle silence."""
         while True:
             encoder = None
@@ -564,7 +606,7 @@ class Radio:
                             queued = False
                         try:
                             encoder.stdin.write(chunk)
-                            await encoder.stdin.drain()
+                            await asyncio.wait_for(encoder.stdin.drain(), self.IO_TIMEOUT)
                         finally:
                             if queued:
                                 self.pcm.task_done()
@@ -580,33 +622,32 @@ class Radio:
                     # start halfway through a frame (bit reservoir is disabled).
                     while True:
                         try:
-                            header = await encoder.stdout.readexactly(4)
+                            header = await asyncio.wait_for(encoder.stdout.readexactly(4), self.IO_TIMEOUT)
                             bits = int.from_bytes(header, "big")
                             if (bits & 0xFFFEFC00) != 0xFFFA9000:
                                 raise RuntimeError("Unexpected MP3 encoder format")
                             frame_size = 144000 * 128 // 44100 + ((bits >> 9) & 1)
-                            frame = header + await encoder.stdout.readexactly(frame_size - 4)
+                            frame = header + await asyncio.wait_for(
+                                encoder.stdout.readexactly(frame_size - 4), self.IO_TIMEOUT)
                         except asyncio.IncompleteReadError as error:
                             raise RuntimeError("Continuous audio encoder stopped") from error
                         await self.broadcast(frame)
 
-                tasks = [asyncio.create_task(coro) for coro in (feed(), pump(), self.produce_pcm(announce))]
+                tasks = [asyncio.create_task(coro) for coro in (feed(), pump())]
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     task.result()
-            except (OSError, RuntimeError, ConnectionError):
-                self.last_error = "Continuous audio encoder failed; check FFmpeg installation. Retrying."
-                LOG.warning(self.last_error)
+            except Exception as error:
+                self.recoveries += 1
+                LOG.warning("Continuous audio encoder failed: type=%s; replacing encoder",
+                            type(error).__name__)
             finally:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
                 await self.stop_process(encoder)
                 self.recent_frames.clear()
-                while not self.pcm.empty():
-                    self.pcm.get_nowait()
-                    self.pcm.task_done()
-            await asyncio.sleep(2)
+            await asyncio.sleep(self.RECOVERY_DELAY)
 
 
 class Bot:
@@ -735,6 +776,8 @@ class Bot:
                 retry_after = response.headers.get("Retry-After", "")
                 wait = f" Server requests a wait of {retry_after} seconds." if retry_after.isdigit() else ""
                 raise LoginPaused("rate_limited", "IMVU rate-limited login (HTTP 429). Login is paused; no automatic retries." + wait)
+            if response.status >= 500:
+                raise aiohttp.ClientConnectionError("IMVU login service temporarily unavailable")
             if response.status not in (200, 201):
                 raise LoginPaused("login_rejected", f"Login rejected: HTTP {response.status}. Check credentials/verification privately. Login is paused; restart only after resolving it.")
             data = await response.json()
@@ -755,17 +798,27 @@ class Bot:
 
     async def login_or_pause(self, force=False):
         """Keep the web process alive on auth failure so hosting cannot restart-loop login."""
-        try:
-            await self.login(force=force)
-        except (LoginPaused, RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ValueError, OSError) as error:
-            self.connected = False
-            self.authenticated.clear()
-            self.status = error.status if isinstance(error, LoginPaused) else "login_paused"
-            self.status_message = str(error) if isinstance(error, RuntimeError) else "Login could not complete. Check configuration/network, then restart once."
-            self.report_room_health("sign_in_failed")
-            LOG.warning("%s", self.status_message)
-            await asyncio.Event().wait()  # Only an explicit process restart attempts login again.
-            return
+        delay = 5
+        while True:
+            try:
+                await self.login(force=force)
+                break
+            except (LoginPaused, RuntimeError, ValueError) as error:
+                self.connected = False
+                self.authenticated.clear()
+                self.status = error.status if isinstance(error, LoginPaused) else "login_paused"
+                self.status_message = str(error) if isinstance(error, RuntimeError) else "Login response invalid; check configuration."
+                self.report_room_health("sign_in_failed")
+                LOG.warning("%s", self.status_message)
+                await asyncio.Event().wait()  # Credentials/security challenges require intervention.
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+                self.connected = False
+                self.authenticated.clear()
+                self.status = "login_retrying"
+                self.status_message = "Temporary login connection problem; retrying automatically."
+                LOG.warning("Login connection failed: type=%s; retrying in %ss", type(error).__name__, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 120)
         self.status = "room_connecting"
         self.status_message = ""
         self.authenticated.set()
@@ -779,7 +832,7 @@ class Bot:
         # Subscribe acknowledgement IDs live inside queues_with_results instead.
         if record == "msg_c2g_send_message":
             payload["op_id"] = self.op
-        await self.ws.send_json(payload)
+        await asyncio.wait_for(self.ws.send_json(payload), 15)
         return self.op
 
     def room_language(self):
@@ -1104,7 +1157,7 @@ class Bot:
         if self.radio.queue.full():
             await self.say("The music queue is full. Please try later.")
             return False
-        track = await self.radio.lookup(url)
+        track = await asyncio.wait_for(self.radio.lookup(url), self.radio.LOOKUP_TIMEOUT)
         if uid not in self.members or not self.allowed_in_room(uid):
             return False
         if self.radio.queue.full():
@@ -1199,7 +1252,7 @@ class Bot:
                 if self.is_song_number(text) and uid in self.song_choices:
                     # A selection must work immediately after its search; the
                     # normal five-second command cooldown does not apply.
-                    await self.pick_song(uid, text)
+                    await asyncio.wait_for(self.pick_song(uid, text), 100)
                     continue
                 if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio", "!move"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
                     continue
@@ -1224,7 +1277,7 @@ class Bot:
                         "\nHost/mod: load this link in this room's IMVU Radio and press Play. " +
                         "Music and queue are separate for each room. Listeners: " + str(len(self.radio.listeners)))
                 elif cmd == "!play":
-                    await self.play_request(uid, query.strip())
+                    await asyncio.wait_for(self.play_request(uid, query.strip()), 100)
                 elif cmd == "!move":
                     if query.strip():
                         await self.say("Type !move by itself and I'll look for a free spot near you.")
@@ -1257,12 +1310,12 @@ class Bot:
                         await self.say("Owner: !ownerblock Username | !ownerunblock Username | !ownerblocked | !owneronly on/off. !language ar-eg | !language en | !language ru | !language auto (this room only). !addroomadmin Username | !removeroomadmin Username | !roomadmins.")
             except MusicLookupError as error:
                 LOG.warning("Music command failed: reason=%s", error.reason)
-                with contextlib.suppress(ConnectionError):
-                    await self.say(str(error))
-            except (RuntimeError, ValueError, asyncio.TimeoutError, aiohttp.ClientError, ConnectionError) as error:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self.say(str(error)), 10)
+            except Exception as error:
                 LOG.warning("A command failed: type=%s; no credentials or media URLs logged.", type(error).__name__)
-                with contextlib.suppress(ConnectionError):
-                    await self.say("Could not complete that request. Try another song or check the server logs.")
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self.say("Could not complete that request. Try another song; the bot is still running."), 10)
             finally:
                 self.commands.task_done()
 
@@ -1367,6 +1420,7 @@ async def main():
     if not os.getenv("DATABASE_URL", "").strip():
         LOG.info("File state enabled; keep permissions and login paths on persistent storage (/app/data/ramsei).")
     LOG.info("Radio endpoint /stream.mp3; diagnostic status /health")
+    LOG.info("Recovery build v12: bounded music lookup, encoder I/O and supervised room workers")
     terminal = None
     control = None
     private_invites = None
