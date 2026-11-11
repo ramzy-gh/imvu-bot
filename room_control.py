@@ -6,12 +6,13 @@ import os
 import re
 import sys
 import stat
+import time
 from urllib.parse import urlparse
 
 from aiohttp import web
 from yarl import URL
 
-from bot import API, Bot, Radio
+from bot import API, Bot, Radio, LoginPaused, supervise
 from permissions import Permissions
 from state_store import StateStore
 
@@ -40,19 +41,28 @@ class Authentication:
         self.lock = asyncio.Lock()
         self.saved = None
         self.failure = None
+        self.retry_at = 0
 
     async def login(self, bot, force=False):
         async with self.lock:
             if self.failure is not None:
                 raise self.failure
+            if time.monotonic() < self.retry_at:
+                raise OSError("Account login is cooling down after a connection failure")
             # Reuse the account login across rooms, including concurrent joins.
             stale = force and self.saved and bot.session.headers.get("X-Imvu-Sauce") == self.saved[2]
             if self.saved is None or stale:
                 try:
                     await bot._login(force=force)
-                except Exception as error:
+                except (LoginPaused, RuntimeError, ValueError) as error:
                     self.failure = error
                     raise
+                except Exception:
+                    # A brief network outage must not poison shared login for
+                    # every room until a manual process restart.
+                    self.retry_at = time.monotonic() + 5
+                    raise
+                self.retry_at = 0
                 self.saved = (bot.user_id,
                     {k: v.value for k, v in bot.session.cookie_jar.filter_cookies(URL(API)).items()},
                     bot.session.headers["X-Imvu-Sauce"])
@@ -165,8 +175,9 @@ class RoomManager:
         async def audio():
             await bot.authenticated.wait()
             await bot.radio.run(bot.say)
-        tasks = [asyncio.create_task(coro) for coro in
-                 (bot.run(), bot.command_worker(), bot.social.run(), audio())]
+        tasks = [asyncio.create_task(supervise(factory, bot.room + ":" + name))
+                 for name, factory in (("connection", bot.run), ("commands", bot.command_worker),
+                                       ("social", bot.social.run), ("audio", audio))]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             if self.room_health_changed:
@@ -303,7 +314,10 @@ class RoomManager:
             "audio_bytes": radio.bytes_sent, "audio_error": radio.last_error,
             "encoder_starts": radio.encoder_starts, "track_starts": radio.track_starts,
             "listener_resyncs": radio.listener_resyncs,
-              "source_retries": radio.source_retries,
+            "source_retries": radio.source_retries,
+            "audio_recoveries": radio.recoveries,
+            "audio_frame_age": (round(time.monotonic() - radio.last_frame_at, 1)
+                                if radio.last_frame_at is not None else None),
             "stream_path": f"/rooms/{bot.room}/stream.mp3"}
 
     async def health(self, request):
