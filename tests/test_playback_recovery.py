@@ -10,7 +10,8 @@ class PlaybackRecovery(unittest.IsolatedAsyncioTestCase):
     async def decode(self, lengths, codes, track, skip_on_refresh=False):
         radio = Radio()
         radio.pcm = asyncio.Queue(maxsize=100)
-        radio.lookup = AsyncMock(return_value={"url": "https://fresh-source"})
+        radio.lookup = AsyncMock(return_value={"url": "https://fresh-source",
+            "http_headers": {"User-Agent": "Fresh media agent", "Referer": "https://fresh.example/"}})
         if skip_on_refresh:
             async def refresh(_):
                 radio.interrupt()
@@ -44,6 +45,8 @@ class PlaybackRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(attempts), 2)
         self.assertAlmostEqual(attempts[1]["offset"], 0.35)
         self.assertEqual(attempts[1]["url"], "https://fresh-source")
+        self.assertEqual(attempts[1]["http_headers"]["User-Agent"], "Fresh media agent")
+        self.assertEqual(attempts[1]["http_headers"]["Referer"], "https://fresh.example/")
         self.assertEqual(radio.source_retries, 1)
         self.assertIsNone(radio.last_error)
         chunks = []
