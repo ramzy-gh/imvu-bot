@@ -330,6 +330,7 @@ class Radio:
         return {"title": " ".join(str(data.get("title") or "Unknown track").split())[:140],
                 "url": selected["url"], "duration": duration,
                 "source": "https://www.youtube.com/watch?v=" + video_id,
+                "http_headers": {"User-Agent": "Mozilla/5.0"},
                 "provider": "youtube_relay"}
 
     async def lookup_relay(self, video_id):
@@ -388,6 +389,7 @@ class Radio:
             raise ValueError("This result has no supported secure audio source.")
         return {"title": str(data.get("title", "Unknown track"))[:140],
                 "url": data["url"], "duration": data["duration"],
+                "http_headers": self.media_headers(data.get("http_headers")),
                 "source": query if query.startswith("soundcloud-track:") else data.get("webpage_url") or target}
 
     def interrupt(self):
@@ -436,14 +438,56 @@ class Radio:
             self.listeners.discard(listener)
         return response
 
+    @staticmethod
+    def media_headers(headers=None):
+        # Media hosts can reject FFmpeg's default Lavf User-Agent. Preserve the
+        # extractor's media headers without forwarding login cookies or secrets.
+        result = {"User-Agent": "Mozilla/5.0"}
+        allowed = {name.lower(): name for name in
+                   ("User-Agent", "Referer", "Origin", "Accept", "Accept-Language")}
+        if isinstance(headers, dict):
+            for name, value in headers.items():
+                canonical = allowed.get(str(name).lower())
+                if (canonical and isinstance(value, str) and 0 < len(value) <= 2048
+                        and not any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                    result[canonical] = value
+        return result
+
     def decoder_args(self, track):
-        return [os.getenv("FFMPEG_BINARY", "ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
+        headers = self.media_headers(track.get("http_headers"))
+        args = [os.getenv("FFMPEG_BINARY", "ffmpeg"), "-nostdin", "-hide_banner", "-loglevel", "error",
                 "-protocol_whitelist", "https,tls,tcp,crypto", "-rw_timeout", "15000000",
                 "-reconnect", "1", "-reconnect_on_network_error", "1",
                 "-reconnect_on_http_error", "429,5xx", "-reconnect_delay_max", "5",
-                "-i", track["url"], "-ss", str(track.get("offset", 0)),
+                "-user_agent", headers.pop("User-Agent")]
+        if headers:
+            args.extend(["-headers", "".join(f"{name}: {value}\r\n" for name, value in headers.items())])
+        return args + ["-i", track["url"], "-ss", str(track.get("offset", 0)),
                 "-t", str(max(0.1, 900 - track.get("offset", 0))), "-vn", "-ac", "2", "-ar", "44100",
                 "-f", "s16le", "pipe:1"]
+
+    @staticmethod
+    async def collect_decoder_errors(reader, tail):
+        # Drain concurrently so a noisy decoder cannot block on a full stderr
+        # pipe. Retain only a small tail for classification, never raw logging.
+        while chunk := await reader.read(4096):
+            tail.extend(chunk)
+            del tail[:-8192]
+
+    @staticmethod
+    def decoder_error_reason(tail):
+        detail = tail.decode("utf-8", errors="replace").lower()
+        match = re.search(r"(?:http (?:error |status )?|server returned )(4\d\d|5\d\d)", detail)
+        if match:
+            return "http_" + match[1]
+        for token, reason in (("not on whitelist", "protocol_not_allowed"),
+                              ("invalid data", "invalid_media"),
+                              ("timed out", "source_timeout"),
+                              ("certificate", "tls_error"),
+                              ("option not found", "decoder_option_error")):
+            if token in detail:
+                return reason
+        return "decoder_error" if detail else "early_eof_or_stall"
 
     @staticmethod
     async def stop_process(proc):
@@ -505,9 +549,13 @@ class Radio:
                 return
             source = dict(track, offset=decoded_bytes / 176400)
             read_task = None
+            error_task = None
+            error_tail = bytearray()
             try:
                 self.proc = await asyncio.create_subprocess_exec(*self.decoder_args(source),
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                if getattr(self.proc, "stderr", None) is not None:
+                    error_task = asyncio.create_task(self.collect_decoder_errors(self.proc.stderr, error_tail))
                 while not self.skip.is_set():
                     read_task = asyncio.create_task(self.proc.stdout.readexactly(17640))
                     done, _ = await asyncio.wait({read_task, stop_task}, timeout=45,
@@ -532,8 +580,21 @@ class Radio:
                     read_task.cancel()
                     await asyncio.gather(read_task, return_exceptions=True)
                 returncode = self.proc.returncode if self.proc else None
-                await self.stop_process(self.proc)
-                self.proc = None
+                try:
+                    if error_task:
+                        if self.proc.returncode is None:
+                            with contextlib.suppress(ProcessLookupError):
+                                self.proc.terminate()
+                        with contextlib.suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(error_task, 1)
+                finally:
+                    if error_task:
+                        error_task.cancel()
+                        await asyncio.gather(error_task, return_exceptions=True)
+                    try:
+                        await self.stop_process(self.proc)
+                    finally:
+                        self.proc = None
             if self.skip.is_set():
                 return
             position = decoded_bytes / 176400
@@ -542,6 +603,8 @@ class Radio:
             # expected end is normal; clean EOF far before it is truncation too.
             if (position > 0 and returncode == 0 and position >= duration - 1) or position >= duration or (returncode == 0 and "duration" not in track):
                 return
+            LOG.warning("Audio decoder ended early: reason=%s exit=%s decoded=%.1fs",
+                        self.decoder_error_reason(error_tail), returncode, position)
             if attempt == 3:
                 self.last_error = "Song source ended early after three resume attempts."
                 LOG.warning("Audio source incomplete: decoded=%.1fs expected=%.1fs", position, duration)
@@ -558,7 +621,9 @@ class Radio:
                         return
                     if refresh not in done:
                         raise asyncio.TimeoutError
-                    track = dict(track, url=refresh.result()["url"])
+                    fresh = refresh.result()
+                    track = dict(track, url=fresh["url"],
+                                 http_headers=self.media_headers(fresh.get("http_headers")))
                 except (RuntimeError, ValueError, OSError, asyncio.TimeoutError):
                     pass  # The original URL may still recover on the next attempt.
                 finally:
