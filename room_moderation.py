@@ -29,7 +29,8 @@ async def native_moderators(bot):
             raise ValueError("Could not verify IMVU room moderators; nothing was booted.")
         for item in items:
             url = item.get("id") if isinstance(item, dict) else item
-            match = re.fullmatch(r"https://api\.imvu\.com/user/user-([1-9]\d*)", str(url))
+            match = re.fullmatch(r"https://api\.imvu\.com/(?:user/|room/room-" + re.escape(bot.room) +
+                                 r"/moderators/)user-([1-9]\d*)", str(url))
             if not match:
                 raise ValueError("Unsupported moderator record; nothing was booted.")
             found.add(match[1])
