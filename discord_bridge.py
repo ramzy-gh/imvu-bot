@@ -72,6 +72,7 @@ class DiscordBridge:
         self.telegram_imported = False
         self.community = None
         self.initializer = None
+        self.profiles = OrderedDict()
 
     async def persist(self):
         async with self.save_lock:
@@ -293,6 +294,48 @@ class DiscordBridge:
         name = name.encode("utf-8", errors="replace").decode("utf-8")
         return "[IMVU room: " + name + " | " + room + "]"
 
+    async def resolve_profiles(self):
+        """Bounded, cached public profile lookup; never delay the IMVU receiver."""
+        if not self.outbox:
+            return
+        events = [e for e in self.outbox if e["room"] == self.outbox[0]["room"]][:30]
+        now = time.monotonic()
+        missing = {}
+        for event in events:
+            uid = event["uid"]
+            cached = self.profiles.get(uid)
+            if cached and cached[0] > now:
+                event.update(cached[1])
+                self.profiles.move_to_end(uid)
+            elif uid not in missing:
+                missing[uid] = event["room"]
+        gate = asyncio.Semaphore(4)
+        async def lookup(uid, room):
+            result = {}
+            entry = self.manager.rooms.get(room)
+            if entry and callable(getattr(entry[0], "api", None)):
+                try:
+                    async with gate:
+                        data = await asyncio.wait_for(entry[0].api("GET", "/user/user-" + uid), 4)
+                    info = data.get("denormalized", {}).get("https://api.imvu.com/user/user-" + uid, {}).get("data", {})
+                    username = info.get("username")
+                    if isinstance(username, str) and re.fullmatch(r"[A-Za-z0-9_]{1,40}", username):
+                        result["name"] = username
+                    nickname = info.get("display_name")
+                    if isinstance(nickname, str):
+                        # Keep Unicode nicknames but strip formatting/control characters and bound length.
+                        import unicodedata
+                        result["nickname"] = "".join(c for c in nickname if not unicodedata.category(c).startswith("C"))[:60].strip()
+                except (RuntimeError, OSError, ValueError, TypeError, AttributeError, aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+            self.profiles[uid] = (time.monotonic() + (3600 if result else 60), result)
+            while len(self.profiles) > 2048:
+                self.profiles.popitem(last=False)
+            for event in events:
+                if event["uid"] == uid:
+                    event.update(result)
+        await asyncio.gather(*(lookup(uid, room) for uid, room in missing.items()))
+
     def batch(self):
         room = self.outbox[0]["room"]
         lines, selected = [self.header(room)], []
@@ -301,6 +344,9 @@ class DiscordBridge:
                 continue
             stamp = datetime.fromtimestamp(event["at"], timezone.utc).strftime("%H:%M:%S UTC")
             name = "@" + event["name"] if event.get("name") else "IMVU " + event["uid"]
+            nickname = event.get("nickname")
+            if nickname and nickname.casefold() != str(event.get("name", "")).casefold():
+                name = re.sub(r"([\\`*_{}\[\]()<>|~])", r"\\\1", nickname) + " (" + name + ")"
             kind = event.get("kind", "chat")
             line = stamp + " " + name + (" " + kind + " the room." if kind != "chat" else ": " + event["text"])
             if size("\n".join([*lines, line])) > 1900:
@@ -316,6 +362,9 @@ class DiscordBridge:
             if not self.outbox:
                 self.wake.clear()
                 await self.wake.wait()
+            if not self.outbox:
+                continue
+            await self.resolve_profiles()
             if not self.outbox:
                 continue
             await self.persist()

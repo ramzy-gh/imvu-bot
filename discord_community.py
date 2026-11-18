@@ -16,6 +16,7 @@ from discord_bridge import DiscordError
 LOG = logging.getLogger("ramsei.discord.community")
 VIEW, SEND, HISTORY = 1024, 2048, 65536
 CRIMSON = 0xE62B4A
+DENIED = "You can't reply to imvu rooms because you are not logged into RamzMotionz account"
 
 
 def button(label, custom_id=None, *, style=2, url=None, disabled=False):
@@ -38,6 +39,7 @@ class DiscordCommunity:
         self.channels = []
         self.categories = {}
         self.room_channels = {}
+        self.room_labels = {}
         self.room_lock = asyncio.Lock()
         self.session_id = self.resume_url = None
         self.sequence = None
@@ -46,15 +48,24 @@ class DiscordCommunity:
         self.seen = {}
         self.portal = getattr(bridge.manager, "portal", None)
         self.order_cursor = 0
+        self.message_lock = asyncio.Lock()
+        self.message_content = False
+        self.last_content_notice = -60
         if self.portal:
             self.portal.db.execute("""CREATE TABLE IF NOT EXISTS discord_order_tickets (
                 order_id TEXT PRIMARY KEY, guild TEXT NOT NULL, channel TEXT NOT NULL,
                 message TEXT, fingerprint TEXT, closed INTEGER NOT NULL DEFAULT 0)""")
+            self.portal.db.execute("""CREATE TABLE IF NOT EXISTS discord_trial_notifications (
+                guild TEXT NOT NULL, room TEXT NOT NULL, message TEXT NOT NULL,
+                PRIMARY KEY(guild, room))""")
 
-    def private_overwrites(self):
-        return [{"id": self.guild, "type": 0, "deny": str(VIEW), "allow": "0"},
+    def private_overwrites(self, existing=()):
+        viewers = [{**o, "allow": str(int(o.get("allow", 0)) & ~SEND),
+                    "deny": str(int(o.get("deny", 0)) | SEND)} for o in existing
+                   if str(o["id"]) not in {self.guild, self.owner, self.bot_id}]
+        return [{"id": self.guild, "type": 0, "deny": str(VIEW | SEND), "allow": "0"},
                 {"id": self.owner, "type": 1, "deny": "0", "allow": str(VIEW | SEND | HISTORY)},
-                {"id": self.bot_id, "type": 1, "deny": "0", "allow": str(VIEW | SEND | HISTORY)}]
+                {"id": self.bot_id, "type": 1, "deny": "0", "allow": str(VIEW | SEND | HISTORY)}, *viewers]
 
     async def ensure_channel(self, name, kind=0, parent=None, private=False, readonly=False, topic=None):
         found = next((c for c in self.channels if c.get("name") == name and c.get("type") == kind
@@ -63,7 +74,7 @@ class DiscordCommunity:
         if parent:
             payload["parent_id"] = parent
         if private:
-            payload["permission_overwrites"] = self.private_overwrites()
+            payload["permission_overwrites"] = self.private_overwrites((found or {}).get("permission_overwrites", ()))
         elif readonly:
             payload["permission_overwrites"] = [
                 {"id": self.guild, "type": 0, "deny": str(SEND), "allow": "0"},
@@ -141,6 +152,8 @@ class DiscordCommunity:
             await self.ensure_channel(name, 2, self.categories["VOICE LOUNGE"])
         self.control = (await self.ensure_channel("bot-control", parent=self.categories["PRIVATE CONTROL"], private=True))["id"]
         await self.ensure_channel("system-status", parent=self.categories["PRIVATE CONTROL"], private=True)
+        self.trials = (await self.ensure_channel("trial-requests", parent=self.categories["PRIVATE CONTROL"], private=True,
+            topic="Private customer trial requests. Trials begin on the first successful IMVU connection."))["id"]
         for room in list(self.bridge.manager.rooms):
             await self.room_channel(room)
         commands = [{"name": "rooms", "description": "List connected IMVU rooms", "type": 1},
@@ -164,10 +177,23 @@ class DiscordCommunity:
 
     async def room_channel(self, room):
         async with self.room_lock:
-            if room not in self.room_channels:
-                channel = await self.ensure_channel("room-" + room, parent=self.categories["IMVU ROOM LOGS"],
-                    private=True, topic=self.bridge.header(room) + " | Owner-only controls and public IMVU room messages.")
-                self.room_channels[room] = channel["id"]
+            entry = self.bridge.manager.rooms.get(room)
+            title = str(getattr(entry[0], "room_name", room) or room) if entry else room
+            slug = re.sub(r"[^\w-]+", "-", title.casefold()).strip("-_") if title != room else "room"
+            name = (slug or "room")[:99-len(room)].rstrip("-_") + "-" + room
+            topic = self.bridge.header(room) + " | ramzydc: type here to send to IMVU. All other viewers are read-only."
+            if room in self.room_channels and self.room_labels.get(room) == (name, topic):
+                return self.room_channels[room]
+            old = next((c for c in self.channels if c.get("type") == 0 and
+                        c.get("parent_id") == self.categories["IMVU ROOM LOGS"] and
+                        (c.get("id") == self.room_channels.get(room) or c.get("name") == "room-" + room
+                         or c.get("name", "").endswith("-" + room))), None)
+            if old and old.get("name") != name:
+                old.update(await self.api("PATCH", "/channels/" + old["id"], json={"name": name}))
+            channel = await self.ensure_channel(name, parent=self.categories["IMVU ROOM LOGS"],
+                private=True, topic=topic)
+            self.room_channels[room] = channel["id"]
+            self.room_labels[room] = (name, topic)
             return self.room_channels[room]
 
     def log_buttons(self, room):
@@ -194,7 +220,8 @@ class DiscordCommunity:
                 "/command room action — advanced room command\n"
                 "Examples for action: `quiet on`, `welcomes off`, `welcome default`, `language ar-eg`, "
                 "`play song name`, `pick 2`, `queue`, `np`, `imvu !admins`.\n"
-                "Every room log has **Reply to IMVU** and **Room Controls** buttons. "
+                  "**ramzydc:** type directly in a room channel to send to that IMVU room. Other viewers cannot send to IMVU.\n"
+                  "Every room log also has **Reply to IMVU** and **Room Controls** buttons. "
                 "Song searches have selection buttons.\n"
                 "VCOIN tickets are private. Verify the receipt in IMVU Wallet before submitting its reference.")
 
@@ -216,7 +243,7 @@ class DiscordCommunity:
     async def interact(self, interaction):
         uid = str((interaction.get("member", {}).get("user") or interaction.get("user") or {}).get("id", ""))
         if str(interaction.get("guild_id", "")) != self.guild or uid != self.owner:
-            await self.callback(interaction, 4, {"content": "Owner-only controls.", "flags": 64})
+            await self.callback(interaction, 4, {"content": DENIED, "flags": 64})
             return
         key = str(interaction["id"])
         if key in self.seen:
@@ -369,13 +396,100 @@ class DiscordCommunity:
                                    (message_id, fingerprint, int(confirmed), order_id))
         self.order_cursor = orders[-1]["discord_scan_id"] if len(orders) == 200 else 0
 
+    async def sync_trials(self):
+        if not self.portal:
+            return
+        requests = self.portal.db.execute("""SELECT r.id, u.display_name, a.expires, n.name,
+                (SELECT MIN(created) FROM audit WHERE room = r.id AND action = 'request-room') AS requested
+            FROM room_access a JOIN rooms r ON r.id = a.room JOIN accounts u ON u.email = r.customer
+            LEFT JOIN room_names n ON n.room = r.id
+            WHERE a.trial_requested = 1 AND u.owner = 0 AND NOT EXISTS (
+                SELECT 1 FROM discord_trial_notifications d WHERE d.guild = ? AND d.room = r.id)
+            ORDER BY r.id LIMIT 100""", (self.guild,)).fetchall()
+        for request in requests:
+            room = request["id"]
+            fields = [{"name": "Room", "value": (request["name"] or room)[:200] + " | " + room},
+                      {"name": "Customer", "value": (request["display_name"] or "Website customer")[:100]},
+                      {"name": "Trial", "value": "3 days; starts on the first successful IMVU connection."}]
+            if request["requested"]:
+                fields.append({"name": "Requested (UTC)", "value": request["requested"]})
+            payload = {"embeds": [{"title": "Customer trial request", "color": CRIMSON, "fields": fields}],
+                       "allowed_mentions": {"parse": []}, "components": [row(button("Open website", url="https://ramzybots.site/"))],
+                       "nonce": hashlib.sha256((self.guild + ":trial:" + room).encode()).hexdigest()[:24], "enforce_nonce": True}
+            sent = await self.api("POST", "/channels/" + self.trials + "/messages", json=payload)
+            self.portal.db.execute("INSERT INTO discord_trial_notifications(guild, room, message) VALUES (?, ?, ?)",
+                                   (self.guild, room, sent["id"]))
+
     async def watch_orders(self):
+        refresh = 0
         while True:
-            try:
-                await self.sync_orders()
-            except Exception as error:
-                LOG.warning("Discord billing sync delayed: type=%s; website orders remain authoritative", type(error).__name__)
+            for sync in (self.sync_orders, self.sync_trials):
+                try:
+                    await sync()
+                except Exception as error:
+                    LOG.warning("Discord website notification delayed: type=%s; website remains authoritative", type(error).__name__)
+            if refresh % 3 == 0:
+                for room in list(self.bridge.manager.rooms):
+                    try:
+                        await self.room_channel(room)
+                    except DiscordError:
+                        break
+            refresh += 1
             await asyncio.sleep(20)
+
+    async def room_message(self, message):
+        """Only the pinned owner can speak, and only into the channel's mapped room."""
+        author = message.get("author") or {}
+        if (str(message.get("guild_id", "")) != self.guild or author.get("bot")
+                or message.get("webhook_id") or message.get("type", 0) not in {0, 19}):
+            return
+        channel = str(message.get("channel_id", ""))
+        room = next((r for r, c in self.room_channels.items() if c == channel), None)
+        if room is None:
+            return
+        async with self.message_lock:
+            key = "message:" + str(message.get("id", ""))
+            if key in self.seen:
+                return
+            self.seen[key] = time.monotonic()
+            self.seen = {k: v for k, v in self.seen.items() if time.monotonic() - v < 900}
+            async def reply(text):
+                await self.bridge.send(text, channel=channel,
+                    message_reference={"message_id": str(message["id"]), "fail_if_not_exists": False})
+            if str(author.get("id", "")) != self.owner:
+                await reply(DENIED)
+                return
+            if not self.message_content:
+                if time.monotonic() - self.last_content_notice >= 60:
+                    await reply("Direct typing needs Message Content Intent enabled in the Discord Developer Portal. Room buttons still work.")
+                    self.last_content_notice = time.monotonic()
+                return
+            text = str(message.get("content") or "").strip()
+            if (not text or len(text) > 430 or text.startswith(("*", "/", "!"))
+                    or any(ord(c) < 32 and c != "\n" for c in text) or message.get("attachments")):
+                await reply("Send plain text, 1-430 characters. Use Room Controls or /command for bot commands; attachments aren't forwarded.")
+                return
+            entry = self.bridge.manager.rooms.get(room)
+            if not entry or not entry[0].connected or not entry[0].chat_ready:
+                await reply("This IMVU room is reconnecting. Nothing was sent.")
+                return
+            try:
+                if not await entry[0].say(text):
+                    await reply("IMVU did not accept the message. Nothing was queued for later.")
+            except (RuntimeError, OSError, aiohttp.ClientError, asyncio.TimeoutError):
+                await reply("Could not send to IMVU. Check the room connection before trying again.")
+
+    async def refresh_content_access(self, ws):
+        while not ws.closed and not self.message_content:
+            await asyncio.sleep(60)
+            try:
+                app = await self.api("GET", "/oauth2/applications/@me")
+            except DiscordError:
+                continue
+            if int(app.get("flags", 0)) & ((1 << 18) | (1 << 19)):
+                self.session_id = self.resume_url = self.sequence = None
+                await ws.close()
+                return
 
     async def heartbeat(self, ws, interval):
         await asyncio.sleep(random.random() * interval)
@@ -391,8 +505,10 @@ class DiscordCommunity:
         gateway = await self.api("GET", "/gateway/bot")
         base = gateway["url"]
         while True:
-            heartbeat = None
+            heartbeat = content_refresh = None
             try:
+                app = await self.api("GET", "/oauth2/applications/@me")
+                self.message_content = bool(int(app.get("flags", 0)) & ((1 << 18) | (1 << 19)))
                 url = (self.resume_url or base).rstrip("/") + "/?v=10&encoding=json"
                 async with self.bridge.session.ws_connect(url, max_msg_size=8 * 1024 * 1024) as ws:
                     hello = await ws.receive_json(timeout=20)
@@ -404,8 +520,11 @@ class DiscordCommunity:
                         await ws.send_json({"op": 6, "d": {"token": self.bridge.token,
                             "session_id": self.session_id, "seq": self.sequence}})
                     else:
-                        await ws.send_json({"op": 2, "d": {"token": self.bridge.token, "intents": 1,
+                        await ws.send_json({"op": 2, "d": {"token": self.bridge.token,
+                            "intents": 1 | (1 << 9) | ((1 << 15) if self.message_content else 0),
                             "properties": {"os": "linux", "browser": "RamzyBots", "device": "RamzyBots"}}})
+                    if not self.message_content:
+                        content_refresh = asyncio.create_task(self.refresh_content_access(ws))
                     async for packet in ws:
                         if packet.type != aiohttp.WSMsgType.TEXT:
                             break
@@ -425,10 +544,15 @@ class DiscordCommunity:
                             break
                         elif op == 0 and event.get("t") == "READY":
                             self.session_id, self.resume_url = event["d"]["session_id"], event["d"]["resume_gateway_url"]
-                            LOG.info("Discord community gateway ready; owner controls enabled")
+                            LOG.info("Discord community gateway ready; owner controls enabled; direct typing=%s", self.message_content)
                         elif op == 0 and event.get("t") == "INTERACTION_CREATE":
                             if len(self.interactions) < 16:
                                 task = asyncio.create_task(self.interact(event["d"]))
+                                self.interactions.add(task)
+                                task.add_done_callback(self.finish_interaction)
+                        elif op == 0 and event.get("t") == "MESSAGE_CREATE":
+                            if len(self.interactions) < 16:
+                                task = asyncio.create_task(self.room_message(event["d"]))
                                 self.interactions.add(task)
                                 task.add_done_callback(self.finish_interaction)
                     if ws.close_code in {4007, 4009}:
@@ -441,6 +565,9 @@ class DiscordCommunity:
                 if heartbeat:
                     heartbeat.cancel()
                     await asyncio.gather(heartbeat, return_exceptions=True)
+                if content_refresh:
+                    content_refresh.cancel()
+                    await asyncio.gather(content_refresh, return_exceptions=True)
             await asyncio.sleep(5)
 
     def finish_interaction(self, task):
