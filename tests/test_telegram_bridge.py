@@ -14,6 +14,26 @@ from telegram_bridge import OUTBOX_LIMIT, TelegramBridge, TelegramError, Telegra
 
 
 class TelegramTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_transport_and_upstream_errors_trigger_route_failover(self):
+        for code in (0, 500, 502, 503, 504, 599):
+            self.assertTrue(TelegramError(code).route_failure)
+        for code in (400, 401, 403, 409, 429):
+            self.assertFalse(TelegramError(code).route_failure)
+
+    async def test_gateway_failures_restart_both_workers_without_losing_backlog(self):
+        for worker in (self.bridge.deliver, self.bridge.poll):
+            with self.subTest(worker=worker.__name__):
+                self.bridge.outbox.clear()
+                self.bridge.record("123-1", "1", "retain through gateway failure", "AccountName")
+                self.bridge.call = AsyncMock(side_effect=TelegramError(502))
+                self.bridge.persist = AsyncMock()
+                with patch("telegram_bridge.asyncio.sleep", new=AsyncMock()):
+                    with self.assertRaises(TelegramError) as caught:
+                        await worker()
+                self.assertEqual(caught.exception.code, 502)
+                self.assertEqual(self.bridge.call.await_count, 3)
+                self.assertEqual(len(self.bridge.outbox), 1)
+
     async def test_route_fallback_keeps_https_hostname_and_other_hosts_use_dns(self):
         resolver = TelegramResolver(True)
         resolver.default.resolve = AsyncMock(return_value=[{"host": "127.0.0.1"}])
