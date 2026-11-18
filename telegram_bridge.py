@@ -6,6 +6,7 @@ import math
 import os
 import re
 import secrets
+import socket
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from state_store import StateStore
 
 LOG = logging.getLogger("ramsei.telegram")
 ROOM = re.compile(r"[1-9]\d*-\d+")
+OUTBOX_LIMIT = 5000
 HELP = ("RAMSEI room bridge\nReply to a forwarded message to speak in that room.\n"
         "/rooms — room settings and music controls\n/control — open room controls\n"
         "/cancel — cancel a settings or song input\n/say ROOM_ID message — send to a specific room\n"
@@ -25,9 +27,10 @@ HELP = ("RAMSEI room bridge\nReply to a forwarded message to speak in that room.
 
 
 class TelegramError(RuntimeError):
-    def __init__(self, code=0, delay=5):
+    def __init__(self, code=0, delay=5, reason="api"):
         super().__init__("Telegram request failed")  # Never include token-bearing URLs.
-        self.code, self.delay = code, min(60, max(1, delay))
+        self.code, self.delay = code, max(1, delay)
+        self.reason = reason
 
 
 class TelegramBridge:
@@ -57,6 +60,8 @@ class TelegramBridge:
         self.wake = asyncio.Event()
         self.save_lock = asyncio.Lock()
         self.dropped = 0
+        self.last_overflow_warning = -60
+        self.last_error = None
         from telegram_controls import TelegramControls
         self.controls = TelegramControls(self)
         try:
@@ -91,7 +96,7 @@ class TelegramBridge:
                     raise ValueError("Invalid Telegram update cursor")
                 self.sequence = int(saved.get("sequence", 0))
                 self.outbox = saved.get("outbox", [])
-                if not isinstance(self.outbox, list) or len(self.outbox) > 500:
+                if not isinstance(self.outbox, list) or len(self.outbox) > OUTBOX_LIMIT:
                     raise ValueError("Invalid Telegram outbox")
                 for event in self.outbox:
                     if (not isinstance(event, dict) or not ROOM.fullmatch(str(event.get("room", "")))
@@ -147,10 +152,15 @@ class TelegramBridge:
             return
         if not isinstance(text, str) or not text.strip() or text.lstrip().startswith("*"):
             return
-        if len(self.outbox) >= 500:
+        if len(self.outbox) >= OUTBOX_LIMIT:
+            # Prefer current chat over old presence notices during an outage.
+            index = next((i for i, event in enumerate(self.outbox)
+                          if event.get("kind") in {"joined", "left"}), 0)
+            self.outbox.pop(index)
             self.dropped += 1
-            LOG.warning("Telegram outbox full; message not retained.")
-            return
+            if time.monotonic() - self.last_overflow_warning >= 60:
+                LOG.warning("Telegram outbox at capacity; oldest pending event replaced; dropped=%s", self.dropped)
+                self.last_overflow_warning = time.monotonic()
         self.sequence += 1
         self.outbox.append({"id": self.sequence, "room": room, "uid": str(uid), "text": text[:600],
                             "at": time.time(), "name": username if isinstance(username, str)
@@ -168,14 +178,22 @@ class TelegramBridge:
     async def call(self, method, **payload):
         try:
             async with self.session.post("https://api.telegram.org/bot" + self.token + "/" + method,
-                                         json=payload, timeout=aiohttp.ClientTimeout(total=40)) as response:
+                                         json=payload, timeout=aiohttp.ClientTimeout(
+                                             total=40, connect=10, sock_connect=10, sock_read=35)) as response:
                 data = await response.json(content_type=None)
                 if response.status != 200 or not data.get("ok"):
                     raise TelegramError(data.get("error_code", response.status),
                                         data.get("parameters", {}).get("retry_after", 5))
                 return data["result"]
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError):
-            raise TelegramError() from None
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, TypeError) as error:
+            raise TelegramError(reason=type(error).__name__) from None
+
+    def log_error(self, operation, error):
+        code = error.code if isinstance(error, TelegramError) else 0
+        reason = error.reason if isinstance(error, TelegramError) else "storage"
+        self.last_error = {"code": code, "reason": reason}
+        LOG.warning("Telegram %s delayed: code=%s reason=%s pending=%s; retained for retry",
+                    operation, code, reason, len(self.outbox))
 
     async def notify(self, text):
         return await self.call("sendMessage", chat_id=self.owner, text=text,
@@ -339,11 +357,13 @@ class TelegramBridge:
         return name
 
     async def deliver(self):
+        failures = 0
         while True:
             if not self.outbox:
                 self.wake.clear()
                 await self.wake.wait()
-            await asyncio.sleep(.75)  # Batch a short burst from one room.
+            if len(self.outbox) < 8:
+                await asyncio.sleep(.75)  # No extra batching delay while draining backlog.
             try:
                 await self.persist()
                 if not self.outbox:
@@ -363,7 +383,7 @@ class TelegramBridge:
                     lines.append(line)
                     selected.append(event["id"])
                     formatted.append((event["id"], line))
-                    if len(selected) >= 8:
+                    if len(selected) >= 30:
                         break
                 ids = frozenset(selected)
                 if not any(event["id"] in ids for event in self.outbox):
@@ -383,10 +403,15 @@ class TelegramBridge:
                 if self.routes.get(str(message_id)) == room:
                     self.fanout(room, formatted)
                 self.state = "connected"
+                self.last_error = None
+                failures = 0
                 await asyncio.sleep(1.05)
             except (TelegramError, OSError) as error:
                 self.state = "retrying"
-                LOG.warning("Telegram forwarding delayed; messages remain in the private outbox.")
+                self.log_error("forwarding", error)
+                failures += 1
+                if isinstance(error, TelegramError) and error.code == 0 and failures >= 3:
+                    raise  # Recreate session and DNS after repeated transport failures.
                 await asyncio.sleep(error.delay if isinstance(error, TelegramError) else 5)
 
     async def handle_message(self, message):
@@ -435,9 +460,11 @@ class TelegramBridge:
         await self.notify(("Sent to room " if sent else "Could not send to room ") + room + ".")
 
     async def poll(self):
+        failures = 0
         while True:
             try:
                 updates = await self.call("getUpdates", offset=self.offset, timeout=25, allowed_updates=["message", "callback_query"])
+                failures = 0
                 for update in updates:
                     update_id = update.get("update_id")
                     if type(update_id) is not int or update_id < (self.offset or 0):
@@ -452,14 +479,21 @@ class TelegramBridge:
                         await self.controls.callback(update["callback_query"])
             except (TelegramError, OSError) as error:
                 self.state = "polling_conflict" if isinstance(error, TelegramError) and error.code == 409 else "retrying"
-                LOG.warning("Telegram receiving delayed; no credential or message contents logged.")
+                self.log_error("receiving", error)
+                failures += 1
+                if isinstance(error, TelegramError) and error.code == 0 and failures >= 3:
+                    raise
                 await asyncio.sleep(error.delay if isinstance(error, TelegramError) else 5)
 
     async def run(self):
         while True:
             tasks = []
             try:
-                async with aiohttp.ClientSession() as self.session:
+                # The host has IPv4 connectivity; avoid broken IPv6 routes and
+                # discard stale pooled connections rather than retrying forever.
+                connector = aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=60,
+                                                 force_close=True)
+                async with aiohttp.ClientSession(connector=connector) as self.session:
                     identity = await self.call("getMe")
                     if identity.get("id") != self.bot_id:
                         raise TelegramError(401)
@@ -477,14 +511,14 @@ class TelegramBridge:
                     self.state = "connected"
                     tasks = [asyncio.create_task(self.deliver()), asyncio.create_task(self.poll())]
                     await asyncio.gather(*tasks)
-            except (TelegramError, OSError, ValueError, TypeError, KeyError):
+            except (TelegramError, OSError, ValueError, TypeError, KeyError) as error:
                 self.state = "retrying"
-                LOG.warning("Telegram bridge unavailable; IMVU rooms remain independent.")
-                await asyncio.sleep(10)
+                self.log_error("connection", error)
             finally:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(10)
 
     async def close(self):
         if self.task:
@@ -500,4 +534,6 @@ class TelegramBridge:
                 await self.persist()
 
     def snapshot(self):
-        return {"state": self.state, "pending_messages": len(self.outbox), "dropped_messages": self.dropped}
+        return {"state": self.state, "pending_messages": len(self.outbox), "dropped_messages": self.dropped,
+                "last_error": self.last_error}
+
