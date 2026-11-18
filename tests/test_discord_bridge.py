@@ -171,6 +171,143 @@ class DiscordTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(portal.one("SELECT * FROM discord_trial_notifications"))
         self.assertEqual(dict(portal.room_access("123-3")), original)
 
+    def operations(self):
+        portal, community = self.billing()
+        community.ops.alerts = "777777771"
+        community.ops.reminders = "777777772"
+        community.ops.board = "777777773"
+        community.ops.started = 0
+        community.api = AsyncMock(return_value={"id": "666666666"})
+        return portal, community
+
+    async def test_health_alerts_debounce_repeats_and_survive_restart(self):
+        portal, community = self.operations()
+        with patch('discord_ops.time.time', return_value=1000):
+            await community.ops.sync_health()
+        self.first.connected = False
+        self.first.room_http_error = 403
+        with patch('discord_ops.time.time', return_value=1001):
+            await community.ops.sync_health()
+        self.assertEqual(portal.one('SELECT count(*) AS n FROM discord_ops_events')['n'], 0)
+        with patch('discord_ops.time.time', return_value=1032):
+            await community.ops.sync_health()
+            await community.ops.sync_health()
+        event = portal.one('SELECT * FROM discord_ops_events')
+        self.assertIn('ACCESS DENIED', event['payload'])
+        self.assertEqual(portal.one('SELECT count(*) AS n FROM discord_ops_events')['n'], 1)
+        from discord_ops import DiscordOperations
+        community.ops = DiscordOperations(community)
+        community.ops.alerts = '777777771'
+        community.ops.started = 0
+        with patch('discord_ops.time.time', return_value=1040):
+            await community.ops.sync_health()
+        self.assertEqual(portal.one('SELECT count(*) AS n FROM discord_ops_events')['n'], 1)
+        self.first.connected = True
+        with patch('discord_ops.time.time', return_value=1041):
+            await community.ops.sync_health()
+        self.assertEqual(portal.one('SELECT count(*) AS n FROM discord_ops_events')['n'], 2)
+
+    async def test_board_updates_existing_messages_and_has_occupants_and_song(self):
+        portal, community = self.operations()
+        self.first.members = {'1', '2'}
+        self.first.user_id = '1'
+        self.first.radio = SimpleNamespace(current={'title': 'Song One'})
+        await community.ops.sync_board()
+        sent = community.api.await_args.kwargs['json']['content']
+        self.assertIn('Occupants: 1', sent)
+        self.assertIn('Song One', sent)
+        calls = community.api.await_count
+        await community.ops.sync_board()
+        self.assertEqual(community.api.await_count, calls)
+        self.first.radio.current = {'title': 'Song Two'}
+        await community.ops.sync_board()
+        self.assertEqual(community.api.await_args.args[0], 'PATCH')
+        from discord_ops import DiscordOperations
+        restored = DiscordOperations(community)
+        restored.board = community.ops.board
+        calls = community.api.await_count
+        await restored.sync_board()
+        self.assertEqual(community.api.await_count, calls)
+
+    async def test_trial_reminders_are_durable_and_paid_renewal_cancels_unsent_reminder(self):
+        portal, community = self.operations()
+        account = portal.one('SELECT * FROM accounts WHERE email = ?', 'buyer@example.test')
+        portal.start_trial('123-3', account)
+        portal.db.execute('UPDATE room_access SET expires=1500 WHERE room=?', ('123-3',))
+        with patch('discord_ops.time.time', return_value=1000):
+            await community.ops.sync_reminders()
+            await community.ops.sync_reminders()
+        self.assertEqual(portal.one('SELECT count(*) AS n FROM discord_ops_events')['n'], 1)
+        community.api.side_effect = DiscordError(500)
+        with patch('discord_ops.time.time', return_value=1000), self.assertRaises(DiscordError):
+            await community.ops.flush()
+        self.assertIsNone(portal.one('SELECT message FROM discord_ops_events')['message'])
+        portal.db.execute("INSERT INTO vcoin_orders(id, room, amount, transfer) VALUES ('paid', '123-3', 700, 'wallet-test')")
+        community.api.reset_mock()
+        await community.ops.flush()
+        community.api.assert_not_awaited()
+        self.assertEqual(portal.one('SELECT message FROM discord_ops_events')['message'], 'cancelled')
+
+    async def test_expired_trial_notice_is_once_and_does_not_include_old_or_unlimited_trials(self):
+        portal, community = self.operations()
+        account = portal.one('SELECT * FROM accounts WHERE email = ?', 'buyer@example.test')
+        portal.start_trial('123-3', account)
+        portal.db.execute('UPDATE room_access SET expires=950 WHERE room=?', ('123-3',))
+        with patch('discord_ops.time.time', return_value=1000):
+            await community.ops.sync_reminders()
+            await community.ops.sync_reminders()
+        self.assertIn('TRIAL EXPIRED', portal.one('SELECT payload FROM discord_ops_events')['payload'])
+        portal.db.execute('DELETE FROM discord_ops_events')
+        portal.db.execute('UPDATE room_access SET unlimited=1 WHERE room=?', ('123-3',))
+        with patch('discord_ops.time.time', return_value=1000):
+            await community.ops.sync_reminders()
+        self.assertIsNone(portal.one('SELECT * FROM discord_ops_events'))
+
+    async def test_proof_request_returns_report_and_safely_shows_note_on_website(self):
+        portal, community = self.operations()
+        before = portal.room_access('123-2')
+        await community.ops.review('0123456789abcdef', 'fresh-event', 'proof', '<script>send private proof</script>')
+        order = portal.one('SELECT * FROM vcoin_orders WHERE id=?', '0123456789abcdef')
+        self.assertIsNone(order['reported_sender'])
+        self.assertIsNone(order['transfer'])
+        self.assertEqual(portal.room_access('123-2'), before)
+        html = portal.vcoin_order_details(None, order, 'approved')
+        self.assertIn('Payment proof requested', html)
+        self.assertIn('&lt;script&gt;', html)
+        self.assertNotIn('<script>', html)
+        self.assertIn('proof', community.ops.history(order['id']))
+        with self.assertRaises(ValueError):
+            await community.confirm_order(order['id'], 'fresh-event', 'wallet-proof')
+        portal.db.execute("UPDATE vcoin_orders SET reported_sender='BuyerIMVU',report_event='new-event' WHERE id=?", (order['id'],))
+        order = portal.one('SELECT * FROM vcoin_orders WHERE id=?', order['id'])
+        self.assertNotIn('Payment proof requested', portal.vcoin_order_details(None, order, 'approved'))
+
+    async def test_closed_tickets_preserve_order_block_confirmation_and_can_reopen(self):
+        portal, community = self.operations()
+        oid = '0123456789abcdef'
+        await community.ops.review(oid, 'fresh-event', 'close', 'Review later')
+        self.assertIsNotNone(portal.one('SELECT * FROM vcoin_orders WHERE id=?', oid))
+        with self.assertRaises(ValueError):
+            await community.confirm_order(oid, 'fresh-event', 'wallet-closed')
+        with self.assertRaises(ValueError):
+            await community.ops.review(oid, 'fresh-event', 'close', 'duplicate')
+        await community.ops.review(oid, 'fresh-event', 'reopen', 'Reopened by owner')
+        await community.confirm_order(oid, 'fresh-event', 'wallet-open')
+        self.assertEqual(portal.one('SELECT count(*) AS n FROM vcoin_review_history')['n'], 3)
+        self.assertIn('confirmed', community.ops.history(oid))
+
+    async def test_review_actions_reject_stale_reports_and_non_owner_interactions(self):
+        portal, community = self.operations()
+        with self.assertRaises(ValueError):
+            await community.ops.review('0123456789abcdef', 'old-event', 'reject', 'not matched')
+        community.callback = AsyncMock()
+        community.modal = AsyncMock()
+        await community.interact({'id': '555555555', 'token': 'test', 'guild_id': community.guild,
+            'member': {'user': {'id': '666666666'}}, 'type': 3,
+            'data': {'custom_id': 'reject|0123456789abcdef|fresh-event'}})
+        community.modal.assert_not_awaited()
+        self.assertIsNone(portal.one('SELECT * FROM vcoin_review_history'))
+
     async def test_reply_is_pinned_to_original_room(self):
         self.bridge.routes["444444444"] = "123-2"
         await self.bridge.handle(self.message("hello", reference="444444444"))
