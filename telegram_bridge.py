@@ -33,6 +33,24 @@ class TelegramError(RuntimeError):
         self.reason = reason
 
 
+class TelegramResolver(aiohttp.abc.AbstractResolver):
+    """Retry a verified Telegram API address when the DNS-selected route fails."""
+    def __init__(self, fallback=False):
+        self.fallback = fallback
+        self.default = aiohttp.resolver.DefaultResolver()
+
+    async def resolve(self, host, port=0, family=socket.AF_INET):
+        if self.fallback and host == "api.telegram.org":
+            # Keep the original HTTPS hostname: aiohttp still validates the
+            # certificate and SNI for api.telegram.org before sending a token.
+            return [{"hostname": host, "host": "149.154.167.220", "port": port,
+                     "family": socket.AF_INET, "proto": 0, "flags": 0}]
+        return await self.default.resolve(host, port, family)
+
+    async def close(self):
+        await self.default.close()
+
+
 class TelegramBridge:
     def __init__(self, manager):
         self.manager = manager
@@ -486,12 +504,14 @@ class TelegramBridge:
                 await asyncio.sleep(error.delay if isinstance(error, TelegramError) else 5)
 
     async def run(self):
+        fallback = False
         while True:
             tasks = []
+            resolver = TelegramResolver(fallback)
             try:
                 # The host has IPv4 connectivity; avoid broken IPv6 routes and
                 # discard stale pooled connections rather than retrying forever.
-                connector = aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=60,
+                connector = aiohttp.TCPConnector(resolver=resolver, family=socket.AF_INET, ttl_dns_cache=60,
                                                  force_close=True)
                 async with aiohttp.ClientSession(connector=connector) as self.session:
                     identity = await self.call("getMe")
@@ -514,10 +534,15 @@ class TelegramBridge:
             except (TelegramError, OSError, ValueError, TypeError, KeyError) as error:
                 self.state = "retrying"
                 self.log_error("connection", error)
+                if isinstance(error, TelegramError) and error.code == 0:
+                    fallback = not fallback
+                    LOG.info("Telegram reconnecting with %s API route; TLS verification remains enabled",
+                             "alternate" if fallback else "DNS")
             finally:
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                await resolver.close()
             await asyncio.sleep(10)
 
     async def close(self):
