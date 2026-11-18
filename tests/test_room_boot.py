@@ -23,7 +23,7 @@ class BootTests(unittest.IsolatedAsyncioTestCase):
         self.mods = {'222'}
         async def api(method, path, **kwargs):
             if method == 'GET' and path.endswith('/moderators'):
-                return {'denormalized': {API + path: {'data': {'items': [API + '/user/user-' + u for u in self.mods]}}}}
+                return {'denormalized': {API + path: {'data': {'items': [API + path + '/user-' + u for u in self.mods]}}}}
             if method == 'DELETE':
                 return {}
             raise AssertionError((method, path))
@@ -102,3 +102,12 @@ class BootTests(unittest.IsolatedAsyncioTestCase):
         self.bot.members.discard('555')
         await boot_user(self.bot, '111', True, 'Target')
         self.assert_no_boot()
+
+    async def test_native_scoped_references_are_accepted_only_for_the_current_room(self):
+        self.assertEqual(await native_moderators(self.bot), {'222'})
+        path = '/room/room-123-1/moderators'
+        self.bot.api.side_effect = None
+        self.bot.api.return_value = {'denormalized': {API + path: {'data': {'items': [
+            API + '/room/room-456-1/moderators/user-555']}}}}
+        with self.assertRaises(ValueError):
+            await native_moderators(self.bot)
