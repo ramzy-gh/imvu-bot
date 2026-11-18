@@ -10,10 +10,23 @@ from unittest.mock import AsyncMock, Mock, patch
 import aiohttp
 
 from bot import Bot, Radio, encode
-from telegram_bridge import OUTBOX_LIMIT, TelegramBridge, TelegramError
+from telegram_bridge import OUTBOX_LIMIT, TelegramBridge, TelegramError, TelegramResolver
 
 
 class TelegramTests(unittest.IsolatedAsyncioTestCase):
+    async def test_route_fallback_keeps_https_hostname_and_other_hosts_use_dns(self):
+        resolver = TelegramResolver(True)
+        resolver.default.resolve = AsyncMock(return_value=[{"host": "127.0.0.1"}])
+        try:
+            result = await resolver.resolve("api.telegram.org", 443)
+            self.assertEqual(result[0]["hostname"], "api.telegram.org")
+            self.assertEqual(result[0]["host"], "149.154.167.220")
+            resolver.default.resolve.assert_not_awaited()
+            await resolver.resolve("example.com", 443)
+            resolver.default.resolve.assert_awaited_once()
+        finally:
+            await resolver.close()
+
     async def test_backlog_larger_than_old_limit_survives_restart(self):
         for i in range(700):
             self.bridge.record("123-1", "1", str(i), "AccountName")
