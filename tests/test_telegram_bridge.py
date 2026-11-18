@@ -10,10 +10,48 @@ from unittest.mock import AsyncMock, Mock, patch
 import aiohttp
 
 from bot import Bot, Radio, encode
-from telegram_bridge import TelegramBridge, TelegramError
+from telegram_bridge import OUTBOX_LIMIT, TelegramBridge, TelegramError
 
 
 class TelegramTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backlog_larger_than_old_limit_survives_restart(self):
+        for i in range(700):
+            self.bridge.record("123-1", "1", str(i), "AccountName")
+        await self.bridge.persist()
+        restarted = TelegramBridge(self.manager)
+        with patch.object(restarted, "run", AsyncMock()):
+            await restarted.start()
+            await restarted.close()
+        self.assertTrue(restarted.enabled)
+        self.assertEqual(len(restarted.outbox), 700)
+
+    def test_overflow_prefers_old_presence_and_keeps_new_chat(self):
+        self.bridge.record("123-1", "1", "old chat")
+        self.bridge.record_membership("123-1", "2", "joined")
+        for i in range(OUTBOX_LIMIT - 2):
+            self.bridge.record("123-1", "1", str(i))
+        with self.assertLogs("ramsei.telegram", level="WARNING") as logs:
+            self.bridge.record("123-1", "1", "new chat")
+            self.bridge.record("123-1", "1", "newest chat")
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(len(self.bridge.outbox), OUTBOX_LIMIT)
+        self.assertEqual(self.bridge.outbox[-1]["text"], "newest chat")
+        self.assertFalse(any(e.get("kind") == "joined" for e in self.bridge.outbox))
+
+    async def test_transport_failures_escape_worker_for_session_recovery(self):
+        self.bridge.record("123-1", "1", "keep this", "AccountName")
+        self.bridge.call = AsyncMock(side_effect=TelegramError(reason="TimeoutError"))
+        self.bridge.persist = AsyncMock()
+        with patch("telegram_bridge.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(TelegramError):
+                await self.bridge.deliver()
+        self.assertEqual(self.bridge.call.await_count, 3)
+        self.assertEqual(self.bridge.outbox[0]["text"], "keep this")
+        self.assertEqual(self.bridge.snapshot()["last_error"]["reason"], "TimeoutError")
+
+    def test_retry_after_is_not_shortened(self):
+        self.assertEqual(TelegramError(429, 120).delay, 120)
+
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         path = Path(self.folder.name)
@@ -153,9 +191,9 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
     async def test_records_exclude_protocol_actions_and_are_bounded(self):
         self.bridge.record("123-1", "1", "*msg SeatAssignment 3 1 2 0")
         self.assertFalse(self.bridge.outbox)
-        for _ in range(501):
+        for _ in range(OUTBOX_LIMIT + 1):
             self.bridge.record("123-1", "1", "message")
-        self.assertEqual(len(self.bridge.outbox), 500)
+        self.assertEqual(len(self.bridge.outbox), OUTBOX_LIMIT)
         self.assertEqual(self.bridge.dropped, 1)
 
     async def test_public_chat_is_relayed_even_when_sender_is_blocked_from_features(self):
@@ -275,3 +313,4 @@ class TelegramTests(unittest.IsolatedAsyncioTestCase):
             await self.bridge.handle_message(self.message(text))
         self.assertFalse(self.bridge.viewers)
         self.assertIn("permanent", self.bridge.notify.await_args.args[0])
+
