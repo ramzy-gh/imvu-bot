@@ -32,6 +32,10 @@ class TelegramError(RuntimeError):
         self.code, self.delay = code, max(1, delay)
         self.reason = reason
 
+    @property
+    def route_failure(self):
+        return self.code == 0 or 500 <= self.code < 600
+
 
 class TelegramResolver(aiohttp.abc.AbstractResolver):
     """Retry a verified Telegram API address when the DNS-selected route fails."""
@@ -428,8 +432,8 @@ class TelegramBridge:
                 self.state = "retrying"
                 self.log_error("forwarding", error)
                 failures += 1
-                if isinstance(error, TelegramError) and error.code == 0 and failures >= 3:
-                    raise  # Recreate session and DNS after repeated transport failures.
+                if isinstance(error, TelegramError) and error.route_failure and failures >= 3:
+                    raise  # Recreate session and route after transport or upstream failures.
                 await asyncio.sleep(error.delay if isinstance(error, TelegramError) else 5)
 
     async def handle_message(self, message):
@@ -499,7 +503,7 @@ class TelegramBridge:
                 self.state = "polling_conflict" if isinstance(error, TelegramError) and error.code == 409 else "retrying"
                 self.log_error("receiving", error)
                 failures += 1
-                if isinstance(error, TelegramError) and error.code == 0 and failures >= 3:
+                if isinstance(error, TelegramError) and error.route_failure and failures >= 3:
                     raise
                 await asyncio.sleep(error.delay if isinstance(error, TelegramError) else 5)
 
@@ -534,7 +538,7 @@ class TelegramBridge:
             except (TelegramError, OSError, ValueError, TypeError, KeyError) as error:
                 self.state = "retrying"
                 self.log_error("connection", error)
-                if isinstance(error, TelegramError) and error.code == 0:
+                if isinstance(error, TelegramError) and error.route_failure:
                     fallback = not fallback
                     LOG.info("Telegram reconnecting with %s API route; TLS verification remains enabled",
                              "alternate" if fallback else "DNS")
