@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from discord_bridge import DiscordBridge, DiscordError, LIMIT, size
-from discord_community import DiscordCommunity, VIEW
+from discord_community import DiscordCommunity, VIEW, SEND, DENIED
 from ramsei_web import Portal
 
 
@@ -42,6 +42,134 @@ class DiscordTests(unittest.IsolatedAsyncioTestCase):
         if reference:
             message["message_reference"] = {"message_id": reference}
         return message
+
+    def community_message(self, **changes):
+        return {"id": "555555555", "author": {"id": self.bridge.owner}, "guild_id": self.bridge.guild,
+                "channel_id": "888888888", "content": "hello from owner", **changes}
+
+    def community(self):
+        community = DiscordCommunity(self.bridge)
+        community.room_channels = {"123-2": "888888888"}
+        community.message_content = True
+        return community
+
+    async def test_direct_typing_and_native_reply_follow_channel_not_reference(self):
+        community = self.community()
+        message = self.community_message(message_reference={"message_id": "another-room"}, type=19)
+        await community.room_message(message)
+        await community.room_message(message)  # Resume replay must not send twice.
+        self.second.say.assert_awaited_once_with("hello from owner")
+        self.first.say.assert_not_awaited()
+
+    async def test_name_impersonation_and_admin_roles_cannot_send(self):
+        community = self.community()
+        await community.room_message(self.community_message(author={"id": "666666666", "username": "ramzydc"},
+            member={"roles": ["administrator"]}))
+        self.second.say.assert_not_awaited()
+        self.assertEqual(self.bridge.send.await_args.args[0], DENIED)
+        self.assertEqual(self.bridge.send.await_args.kwargs["channel"], "888888888")
+
+    async def test_direct_chat_ignores_other_guilds_channels_bots_and_webhooks(self):
+        community = self.community()
+        for change in ({"guild_id": "123123123"}, {"channel_id": "123123123"},
+                       {"author": {"id": self.bridge.owner, "bot": True}}, {"webhook_id": "123"}):
+            await community.room_message(self.community_message(**change))
+        self.second.say.assert_not_awaited()
+        self.bridge.send.assert_not_awaited()
+
+    async def test_direct_chat_rejects_commands_attachments_and_disconnected_room(self):
+        community = self.community()
+        for i, change in enumerate(({"content": "!addadmin attacker"}, {"content": "*msg SeatAssignment"},
+                                    {"content": "hello", "attachments": [{"url": "https://test"}]})):
+            await community.room_message(self.community_message(id=str(i), **change))
+        self.second.connected = False
+        await community.room_message(self.community_message())
+        self.second.say.assert_not_awaited()
+
+    async def test_disabled_content_access_does_not_send_empty_content(self):
+        community = self.community()
+        community.message_content = False
+        await community.room_message(self.community_message(content=""))
+        self.second.say.assert_not_awaited()
+        self.assertIn("Message Content Intent", self.bridge.send.await_args.args[0])
+
+    def test_existing_viewers_remain_view_only_on_restart(self):
+        community = self.community()
+        overwrites = community.private_overwrites([{"id": "777777777", "type": 0,
+                                                     "allow": str(VIEW | SEND), "deny": "0"}])
+        viewer = next(o for o in overwrites if o["id"] == "777777777")
+        self.assertTrue(int(viewer["allow"]) & VIEW)
+        self.assertFalse(int(viewer["allow"]) & SEND)
+        self.assertTrue(int(viewer["deny"]) & SEND)
+        self.assertTrue(int(overwrites[0]["deny"]) & SEND)
+
+    async def test_public_profiles_have_unicode_nickname_and_cached_exact_username(self):
+        self.first.api = AsyncMock(return_value={"denormalized": {"https://api.imvu.com/user/user-123": {
+            "data": {"username": "Guest_RealName", "display_name": "★ Egyptian\nNick"}}}})
+        self.bridge.record("123-1", "123", "hello")
+        await self.bridge.resolve_profiles()
+        self.assertIn("★ EgyptianNick (@Guest_RealName)", self.bridge.batch()[1])
+        await self.bridge.resolve_profiles()
+        self.first.api.assert_awaited_once()
+
+    async def test_failed_profile_lookup_preserves_chat_and_retries_are_cached(self):
+        self.first.api = AsyncMock(side_effect=RuntimeError("profile unavailable"))
+        self.bridge.record("123-1", "123", "hello")
+        await self.bridge.resolve_profiles()
+        await self.bridge.resolve_profiles()
+        self.assertIn("IMVU 123: hello", self.bridge.batch()[1])
+        self.assertEqual(len(self.bridge.outbox), 1)
+        self.first.api.assert_awaited_once()
+
+    async def test_room_name_changes_rename_existing_channel_with_name_first(self):
+        community = self.community()
+        community.categories["IMVU ROOM LOGS"] = "777777777"
+        community.channels = [{"id": "888888888", "type": 0, "name": "room-123-2", "parent_id": "777777777"}]
+        async def api(method, path, **kwargs):
+            self.assertEqual(path, "/channels/888888888")
+            self.assertEqual(method, "PATCH")
+            return {**community.channels[0], **kwargs["json"]}
+        community.api = AsyncMock(side_effect=api)
+        self.second.room_name = "Moonlight Palace"
+        self.assertEqual(await community.room_channel("123-2"), "888888888")
+        self.assertEqual(community.channels[0]["name"], "moonlight-palace-123-2")
+        calls = community.api.await_count
+        await community.room_channel("123-2")
+        self.assertEqual(community.api.await_count, calls)
+        self.second.room_name = "New Palace"
+        await community.room_channel("123-2")
+        self.assertEqual(community.channels[0]["name"], "new-palace-123-2")
+
+    async def test_trial_notifications_are_private_deduplicated_and_exclude_email(self):
+        portal, community = self.billing()
+        account = portal.one("SELECT * FROM accounts WHERE email = ?", "buyer@example.test")
+        portal.start_trial("123-3", account)
+        community.trials = "777777777"
+        community.api = AsyncMock(return_value={"id": "666666666"})
+        await community.sync_trials()
+        await community.sync_trials()
+        community.api.assert_awaited_once()
+        args = community.api.await_args
+        self.assertEqual(args.args[1], "/channels/777777777/messages")
+        self.assertNotIn("buyer@example.test", str(args.kwargs))
+        self.assertIn("123-3", str(args.kwargs))
+        restored = DiscordCommunity(self.bridge)
+        restored.trials = community.trials
+        restored.api = AsyncMock()
+        await restored.sync_trials()
+        restored.api.assert_not_awaited()
+
+    async def test_failed_trial_notification_is_retried_without_changing_access(self):
+        portal, community = self.billing()
+        account = portal.one("SELECT * FROM accounts WHERE email = ?", "buyer@example.test")
+        portal.start_trial("123-3", account)
+        original = dict(portal.room_access("123-3"))
+        community.trials = "777777777"
+        community.api = AsyncMock(side_effect=DiscordError(500))
+        with self.assertRaises(DiscordError):
+            await community.sync_trials()
+        self.assertIsNone(portal.one("SELECT * FROM discord_trial_notifications"))
+        self.assertEqual(dict(portal.room_access("123-3")), original)
 
     async def test_reply_is_pinned_to_original_room(self):
         self.bridge.routes["444444444"] = "123-2"
