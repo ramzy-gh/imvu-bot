@@ -739,6 +739,7 @@ class Bot:
         self.connected = False
         self.status = "starting"
         self.status_message = ""
+        self.room_http_error = None
         self.authenticated = asyncio.Event()
         self.chat_ready = False
         self.announced = False
@@ -1108,6 +1109,7 @@ class Bot:
             report(self.room, reason)
 
     async def confirm_chat_ready(self):
+        self.room_http_error = None
         if self.chat_ready:
             return
         self.chat_ready = True
@@ -1346,7 +1348,7 @@ class Bot:
                     # normal five-second command cooldown does not apply.
                     await asyncio.wait_for(self.pick_song(uid, text), 100)
                     continue
-                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio", "!move"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
+                if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio", "!move", "!boot"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
                     continue
                 now = time.monotonic()
                 if now - self.cooldowns.get(uid, -1000) < 5:
@@ -1361,6 +1363,9 @@ class Bot:
                         await self.room_manager.chat_command(self, uid, verified, cmd, query.strip())
                 elif cmd in MANAGEMENT_COMMANDS:
                     await self.management_command(uid, verified, cmd, query.strip())
+                elif cmd == "!boot":
+                    from room_moderation import boot_user
+                    await boot_user(self, uid, verified, query.strip())
                 elif cmd == "!radio":
                     base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
                     path = f"/rooms/{self.room}/stream.mp3"
@@ -1395,7 +1400,7 @@ class Bot:
                     await self.say("Next: " + " | ".join(titles) if titles else "The queue is empty.")
                 else:
                     await self.say("🎶 !play <song / اسم الأغنية> | !radio !queue !np !skip !stop | !move: come near you | 🎲 !game !guess !joke !dare !fortune !scores | Chat: Ramsei / رامسي 😎")
-                    await self.say("Music search: !play <song or artist>, then reply 1-10 to choose. A YouTube link queues directly.")
+                    await self.say("Music search: !play <song or artist>, then reply 1-10 to choose. A YouTube link queues directly. Room admins: !boot Username (staff are protected).")
                     if self.permissions.authorization_error(uid, verified, "!rooms", self.room) is None:
                         await self.say("Room controls: !join <room ID/link> | !leave <room ID/here> | !rooms | !mainroom. Main room stays connected.")
                     if self.permissions.authorization_error(uid, verified, "!addadmin", self.room) is None:
@@ -1472,6 +1477,7 @@ class Bot:
                     LOG.warning("Saved login expired; trying password-only IMVU login")
                     await self.login_or_pause(force=True)
                 except (RuntimeError, aiohttp.ClientError, asyncio.TimeoutError, ConnectionError, ValueError) as error:
+                    self.room_http_error = error.status if isinstance(error, IMVURequestError) else None
                     if isinstance(error, IMVURequestError) and error.status in (403, 404):
                         reason = "room_unavailable"
                     elif isinstance(error, asyncio.TimeoutError):

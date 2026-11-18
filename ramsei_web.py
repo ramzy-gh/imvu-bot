@@ -197,6 +197,14 @@ class Portal:
             CREATE TABLE IF NOT EXISTS retired_wallet_transfers (
                 fingerprint TEXT PRIMARY KEY
             );
+            CREATE TABLE IF NOT EXISTS vcoin_reviews (
+                order_id TEXT PRIMARY KEY, event TEXT NOT NULL, state TEXT NOT NULL,
+                note TEXT NOT NULL, actor TEXT NOT NULL, created INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS vcoin_review_history (
+                id INTEGER PRIMARY KEY, order_id TEXT NOT NULL, event TEXT NOT NULL,
+                action TEXT NOT NULL, note TEXT NOT NULL, actor TEXT NOT NULL, created INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS billing_email_outbox (
                 kind TEXT NOT NULL,
                 room TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
@@ -1458,6 +1466,11 @@ class Portal:
         fields = (f'<input type="hidden" name="room" value="{room}">'
                   f'<input type="hidden" name="order" value="{order_id}">')
         content = f"<p><span>VCOIN order</span> <code>{order_id}</code> · {order['amount']:,} VCOIN</p>"
+        review = self.one("SELECT action AS state, note FROM vcoin_review_history WHERE order_id = ? AND event = ? AND action IN ('reject', 'proof') ORDER BY id DESC LIMIT 1",
+                          order["id"], str(order["report_event"] or ""))
+        if review and review["state"] in {"reject", "proof"}:
+            label = "Payment report rejected" if review["state"] == "reject" else "Payment proof requested"
+            content += f'<p><strong>{label}</strong></p><p>{escape(review["note"])}</p>'
         if order["reported_sender"]:
             content += ('<p><span>Reported by IMVU user</span> '
                         f'<bdi>{escape(order["reported_sender"])}</bdi></p><p>Awaiting wallet verification</p>')

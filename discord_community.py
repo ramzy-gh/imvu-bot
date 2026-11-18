@@ -58,6 +58,8 @@ class DiscordCommunity:
             self.portal.db.execute("""CREATE TABLE IF NOT EXISTS discord_trial_notifications (
                 guild TEXT NOT NULL, room TEXT NOT NULL, message TEXT NOT NULL,
                 PRIMARY KEY(guild, room))""")
+        from discord_ops import DiscordOperations
+        self.ops = DiscordOperations(self)
 
     def private_overwrites(self, existing=()):
         viewers = [{**o, "allow": str(int(o.get("allow", 0)) & ~SEND),
@@ -154,6 +156,7 @@ class DiscordCommunity:
         await self.ensure_channel("system-status", parent=self.categories["PRIVATE CONTROL"], private=True)
         self.trials = (await self.ensure_channel("trial-requests", parent=self.categories["PRIVATE CONTROL"], private=True,
             topic="Private customer trial requests. Trials begin on the first successful IMVU connection."))["id"]
+        await self.ops.setup()
         for room in list(self.bridge.manager.rooms):
             await self.room_channel(room)
         commands = [{"name": "rooms", "description": "List connected IMVU rooms", "type": 1},
@@ -255,6 +258,10 @@ class DiscordCommunity:
         parts = custom.split("|")
         action = parts[0]
         room = parts[1] if len(parts) > 1 else ""
+        if kind == 3 and action in {"reject", "proof", "close"} and len(parts) == 3:
+            await self.modal(interaction, action + "|" + room + "|" + parts[2], "VCOIN review action",
+                "Reason / private proof instructions", maximum=300)
+            return
         if kind == 3 and action in {"reply", "play", "language", "welcome", "payment"}:
             if action == "payment":
                 if len(parts) != 3:
@@ -286,6 +293,13 @@ class DiscordCommunity:
                     if len(action_parts) > 1:
                         line += " " + action_parts[1]
             elif kind == 3:
+                if action == "history":
+                    await self.followup(interaction, self.ops.history(room))
+                    return
+                if action == "reopen" and len(parts) == 3:
+                    await self.ops.review(room, parts[2], "reopen", "Reopened by owner")
+                    await self.followup(interaction, "Ticket reopened. The website order is unchanged.")
+                    return
                 if action == "control":
                     await self.followup(interaction, **self.panel(room))
                     return
@@ -308,6 +322,12 @@ class DiscordCommunity:
                 if action == "confirm":
                     await self.confirm_order(room, parts[2] if len(parts) > 2 else "", value)
                     await self.followup(interaction, "Receipt confirmed. Website access and payment history updated.")
+                    return
+                if action in {"reject", "proof", "close"} and len(parts) == 3:
+                    await self.ops.review(room, parts[2], action, value)
+                    await self.followup(interaction, "Review recorded. No payment was confirmed. " +
+                        ("Ticket closed; the order and history are preserved." if action == "close" else
+                         "The customer can see your reason on the website and resubmit the payment report."))
                     return
                 command = "say" if action == "reply" else action
                 if command not in {"say", "play", "language", "welcome"}:
@@ -338,6 +358,9 @@ class DiscordCommunity:
                 raise ValueError("That order is missing or already confirmed.")
             if not order["reported_sender"] or not event or order["report_event"] != event:
                 raise ValueError("The payment report changed. Reopen the latest ticket before confirming.")
+            review = self.portal.one("SELECT * FROM vcoin_reviews WHERE order_id = ?", order_id)
+            if review and review["event"] == event and review["state"] == "close":
+                raise ValueError("Reopen this ticket before confirming a payment.")
             owner = self.portal.one("SELECT * FROM accounts WHERE owner = 1 LIMIT 1")
             if not owner:
                 raise ValueError("Website owner is not configured.")
@@ -346,13 +369,15 @@ class DiscordCommunity:
                 "order": order_id, "transfer": reference, "verified": "1"})
             self.portal.db.execute("INSERT INTO audit(actor, room, action) VALUES (?, ?, ?)",
                                   ("discord:" + self.owner, order["room"], "confirm-vcoin"))
+            self.ops.record(order_id, event, "confirmed", "Wallet receipt verified; website access updated")
 
     async def sync_orders(self):
         if not self.portal:
             return
         orders = self.portal.db.execute("""SELECT o.*, o.rowid AS discord_scan_id FROM vcoin_orders o
             LEFT JOIN discord_order_tickets d ON d.order_id = o.id
-            WHERE (o.transfer IS NULL OR (d.guild = ? AND d.closed = 0)) AND o.rowid > ?
+            WHERE (o.transfer IS NULL OR (d.guild = ? AND (d.closed = 0 OR EXISTS (
+                SELECT 1 FROM vcoin_reviews v WHERE v.order_id = o.id)))) AND o.rowid > ?
             ORDER BY o.rowid LIMIT 200""", (self.guild, self.order_cursor)).fetchall()
         for order in orders:
             order_id = order["id"]
@@ -369,17 +394,29 @@ class DiscordCommunity:
                 ticket = self.portal.one("SELECT * FROM discord_order_tickets WHERE order_id = ?", order_id)
             confirmed = order["transfer"] is not None
             reported = bool(order["reported_sender"])
+            event = str(order["report_event"] or "")
+            review = self.portal.one("SELECT * FROM vcoin_reviews WHERE order_id = ? AND event = ?", order_id, event)
+            state = review["state"] if review else ""
+            closed = state == "close"
             status = "CONFIRMED" if confirmed else "READY FOR OWNER REVIEW" if reported else "AWAITING PAYMENT REPORT"
+            if not confirmed and state in {"reject", "proof", "close"}:
+                status = {"reject": "REPORT REJECTED • CUSTOMER CAN RESUBMIT", "proof": "PROOF REQUESTED • CUSTOMER CAN RESUBMIT", "close": "TICKET CLOSED • ORDER PRESERVED"}[state]
             fields = [{"name": "Room", "value": order["room"], "inline": True},
                       {"name": "Order amount", "value": str(order["amount"]) + " VCOIN", "inline": True},
                       {"name": "Plan", "value": str(order["duration"] // 86400) + " days", "inline": True},
                       {"name": "Reported IMVU sender", "value": order["reported_sender"] or "Not reported yet"}]
+            if review:
+                fields.append({"name": "Latest review", "value": str(review["note"])[:300]})
             content = {"embeds": [{"title": "VCOIN • " + order_id, "description": status,
                 "color": 0x38B87C if confirmed else CRIMSON, "fields": fields,
                 "footer": {"text": "Confirm only after matching the transfer in your IMVU Wallet."}}],
                 "allowed_mentions": {"parse": []}, "components": [row(
                     button("Verify received payment", "payment|" + order_id + "|" + str(order["report_event"] or ""),
-                           style=3, disabled=confirmed or not reported),
+                           style=3, disabled=confirmed or not reported or closed),
+                    button("Reject report", "reject|" + order_id + "|" + event, style=4, disabled=confirmed or not reported or closed),
+                    button("Request proof", "proof|" + order_id + "|" + event, disabled=confirmed or not reported or closed)), row(
+                    button("Reopen ticket" if closed else "Close ticket", ("reopen|" if closed else "close|") + order_id + "|" + event),
+                    button("Action history", "history|" + order_id),
                     button("Open website", url=os.getenv("PUBLIC_BASE_URL", "https://ramzybots.site").rstrip("/") + "/owner/payments"))]}
             fingerprint = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
             if ticket["fingerprint"] == fingerprint:
@@ -423,7 +460,7 @@ class DiscordCommunity:
     async def watch_orders(self):
         refresh = 0
         while True:
-            for sync in (self.sync_orders, self.sync_trials):
+            for sync in (self.sync_orders, self.sync_trials, self.ops.sync_health, self.ops.sync_reminders, self.ops.sync_board, self.ops.flush) if self.portal else ():
                 try:
                     await sync()
                 except Exception as error:
