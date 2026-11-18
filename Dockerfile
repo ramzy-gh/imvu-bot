@@ -10,6 +10,7 @@ COPY offline_chat.py offline_seed.txt ./
 COPY wardrobe.py ./
 COPY movement.py ./
 COPY telegram_bridge.py ./
+COPY discord_bridge.py discord_community.py ./
 COPY room_control.py ./
 COPY room_language.py room_settings.py private_invites.py telegram_controls.py ramsei_web.py ramsei_web.css ramzy_locale.py ./
 COPY ramzy_share.png.b64 ./
@@ -21,3 +22,4 @@ RUN sed -i 's/\r$//' /usr/local/bin/ramsei-entrypoint && chmod 755 /usr/local/bi
 ENTRYPOINT ["/usr/local/bin/ramsei-entrypoint"]
 EXPOSE 3000
 CMD ["python", "bot.py"]
+

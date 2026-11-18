@@ -1920,6 +1920,7 @@ class Portal:
 
 def install_website(app, manager):
     portal = Portal(manager)
+    manager.portal = portal
     manager.room_access_check = portal.room_can_join
     manager.room_paused = portal.pause_room
     manager.room_health_changed = portal.record_room_health
@@ -2020,3 +2021,4 @@ addEventListener('pointerdown', event => {
 
     app.on_cleanup.append(close)
     return portal
+

@@ -928,9 +928,10 @@ class Bot:
                 self.pending_chat_ops.discard(min(self.pending_chat_ops))
             self.diagnostics["messages_sent"] += 1
             self.last_said = time.monotonic()
-            bridge = getattr(self.room_manager, "telegram", None)
-            if bridge:
-                bridge.record(self.room, self.user_id, text, os.getenv("IMVU_USERNAME", "Ramsei"))
+            for provider in ("telegram", "discord"):
+                bridge = getattr(self.room_manager, provider, None)
+                if bridge:
+                    bridge.record(self.room, self.user_id, text, os.getenv("IMVU_USERNAME", "Ramsei"))
             return True
 
     async def load_room_name(self, data=None):
@@ -954,12 +955,13 @@ class Bot:
             raise RuntimeError("Membership snapshot omitted the bot; no join/leave events recorded.")
         self.last_membership_refresh = time.monotonic()
         if self.members_initialized:
-            bridge = getattr(self.room_manager, "telegram", None)
-            if bridge:
-                for uid in sorted(new - self.members - {self.user_id}):
-                    bridge.record_membership(self.room, uid, "joined")
-                for uid in sorted(self.members - new - {self.user_id}):
-                    bridge.record_membership(self.room, uid, "left")
+            for provider in ("telegram", "discord"):
+                bridge = getattr(self.room_manager, provider, None)
+                if bridge:
+                    for uid in sorted(new - self.members - {self.user_id}):
+                        bridge.record_membership(self.room, uid, "joined")
+                    for uid in sorted(self.members - new - {self.user_id}):
+                        bridge.record_membership(self.room, uid, "left")
             if new - self.members - {self.user_id}:
                 self.appearance_pending = True
             for uid in sorted(new - self.members - {self.user_id}):
@@ -1164,12 +1166,13 @@ class Bot:
             if command:
                 self.diagnostics["accepted_messages"] += 1
                 uid, text, verified = command
-                bridge = getattr(self.room_manager, "telegram", None)
-                if bridge:
-                    # Relay public chat before feature blocks or command aliases
-                    # change it. Private whispers and system actions are excluded
-                    # by decode_message, and own messages are relayed by say().
-                    bridge.record(self.room, uid, text)
+                for provider in ("telegram", "discord"):
+                    bridge = getattr(self.room_manager, provider, None)
+                    if bridge:
+                        # Relay public chat before feature blocks or command aliases
+                        # change it. Private whispers and system actions are excluded
+                        # by decode_message, and own messages are relayed by say().
+                        bridge.record(self.room, uid, text)
                 text = normalize_management_message(text)
                 command = uid, text, verified
                 if not self.allowed_in_room(uid):
@@ -1556,3 +1559,4 @@ if __name__ == "__main__":
         # Deliberately avoid tracebacks containing authentication or signed media URLs.
         LOG.error("Startup stopped: %s", str(error) if isinstance(error, RuntimeError) else type(error).__name__)
         sys.exit(1)
+

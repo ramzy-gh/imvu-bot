@@ -88,6 +88,7 @@ class RoomManager:
         self.pending = set()
         self.closing = False
         self.telegram = None
+        self.discord = None
         from room_settings import RoomSettings
         self.settings = RoomSettings(self.permissions.path.with_name("room-settings.json"))
         self.language_store = StateStore("room-languages", str(self.permissions.path.with_name("room-languages.json")))
@@ -148,7 +149,14 @@ class RoomManager:
             LOG.info("%s", await self.join(room))
         from telegram_bridge import TelegramBridge
         self.telegram = TelegramBridge(self)
-        await self.telegram.start()
+        if os.getenv("CHAT_RELAY", "telegram").strip().lower() != "discord":
+            await self.telegram.start()
+        else:
+            self.telegram.enabled = False
+            self.telegram.state = "disabled"
+        from discord_bridge import DiscordBridge
+        self.discord = DiscordBridge(self)
+        await self.discord.start()
 
     async def join(self, room):
         room = room_id(room)
@@ -240,6 +248,8 @@ class RoomManager:
             await asyncio.to_thread(self.permissions.remove_room, room)
             if self.telegram:
                 await self.telegram.remove_room(room)
+            if self.discord:
+                await self.discord.remove_room(room)
         except (OSError, ValueError):
             raise ValueError("The room is disconnected, but some saved data could not be removed. Try Remove room again.") from None
 
@@ -324,7 +334,8 @@ class RoomManager:
         rooms = [self.snapshot(bot) for bot, _ in self.rooms.values()]
         default = next((room for room in rooms if room["room"] == self.default_room), {"status": "not_joined"})
         return web.json_response({**default, "main_room": self.default_room, "rooms": rooms,
-                                  "telegram": self.telegram.snapshot() if self.telegram else {"state": "disabled"}})
+                                  "telegram": self.telegram.snapshot() if self.telegram else {"state": "disabled"},
+                                  "discord": self.discord.snapshot() if self.discord else {"state": "disabled"}})
 
     async def stream(self, request):
         room = request.match_info.get("room", self.default_room)
@@ -406,6 +417,8 @@ class RoomManager:
         self.closing = True
         if self.telegram:
             await self.telegram.close()
+        if self.discord:
+            await self.discord.close()
         for task in tuple(self.pending):
             task.cancel()
         await asyncio.gather(*self.pending, return_exceptions=True)
@@ -413,3 +426,4 @@ class RoomManager:
             if self.room_health_changed and getattr(bot, "connected", False) and getattr(bot, "chat_ready", False):
                 self.room_health_changed(room, "service_restart")
             await self.stop_room(room)
+
