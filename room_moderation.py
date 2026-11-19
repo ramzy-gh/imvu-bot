@@ -5,7 +5,7 @@ import re
 from urllib.parse import urlparse
 
 from identity import resolve_username, UserLookupError
-from permissions import OWNER_ID
+from permissions import OWNER_ID, actor_present
 
 API = "https://api.imvu.com"
 LOG = logging.getLogger("ramsei.moderation")
@@ -50,7 +50,7 @@ async def native_moderators(bot):
 
 
 def authorized(bot, actor, moderators):
-    return (actor in bot.members and bot.allowed_in_room(actor) and
+    return (actor_present(bot, actor) and bot.allowed_in_room(actor) and
             (bot.permissions.is_admin(actor, bot.room) or bot.permissions.is_mod(actor)
              or actor in moderators or actor == bot.room.split("-")[0]))
 
@@ -63,7 +63,7 @@ def protected(bot, target, moderators):
 
 async def boot_user(bot, actor, verified, query):
     actor = str(actor)
-    if not verified or actor not in bot.members or not bot.allowed_in_room(actor):
+    if not verified or not actor_present(bot, actor) or not bot.allowed_in_room(actor):
         await bot.say("Only a verified admin present in this room can use !boot.")
         return
     if not query or len(query.split()) != 1:
@@ -117,3 +117,4 @@ async def boot_user(bot, actor, verified, query):
     except Exception as error:
         LOG.warning("Boot request could not finish: room=%s type=%s", bot.room, type(error).__name__)
         await bot.say("IMVU could not complete the boot. Check the bot's native room-moderator permission and try again.")
+

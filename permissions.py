@@ -1,5 +1,6 @@
 """Persistent bot permissions. Usernames are never authorization credentials."""
 import os
+import contextvars
 import re
 import threading
 from pathlib import Path
@@ -7,6 +8,23 @@ from state_store import StateStore
 
 OWNER_ID = "214900673"
 OWNER_NAME = "Ramzy"
+
+# Only authenticated Discord entry points construct this marker. IMVU packets
+# always produce ordinary tuples and cannot claim remote owner provenance.
+class OwnerCommand(tuple):
+    def __new__(cls, room, text):
+        value = super().__new__(cls, (OWNER_ID, text, True))
+        value.room = room
+        return value
+
+
+REMOTE_OWNER_ROOM = contextvars.ContextVar("remote_owner_room", default=None)
+
+
+def actor_present(bot, uid):
+    return (str(uid) in bot.members or
+            (str(uid) == OWNER_ID and REMOTE_OWNER_ROOM.get() == bot.room))
+
 
 
 class Permissions:
@@ -265,3 +283,4 @@ def normalize_management_message(text):
     if parts and parts[0].startswith(("/", "!")) and "!" + parts[0][1:].lower() in MANAGEMENT_COMMANDS | ROOM_COMMANDS:
         return canonical_management_command("!" + parts[0][1:].lower()) + (" " + parts[1] if len(parts) > 1 else "")
     return text
+

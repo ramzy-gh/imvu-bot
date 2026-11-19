@@ -13,7 +13,7 @@ from aiohttp import web
 from yarl import URL
 
 from bot import API, Bot, Radio, LoginPaused, supervise
-from permissions import Permissions
+from permissions import Permissions, actor_present
 from state_store import StateStore
 
 LOG = logging.getLogger("ramsei.rooms")
@@ -267,7 +267,7 @@ class RoomManager:
         if error:
             await source.say(error)
             return
-        if str(uid) not in source.members or not source.connected or not source.chat_ready:
+        if not actor_present(source, uid) or not source.connected or not source.chat_ready:
             await source.say("You must be present in this connected room to use room controls.")
             return
         try:
@@ -426,4 +426,5 @@ class RoomManager:
             if self.room_health_changed and getattr(bot, "connected", False) and getattr(bot, "chat_ready", False):
                 self.room_health_changed(room, "service_restart")
             await self.stop_room(room)
+
 

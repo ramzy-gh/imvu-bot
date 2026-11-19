@@ -12,6 +12,7 @@ import time
 import aiohttp
 
 from discord_bridge import DiscordError
+from permissions import OWNER_ID, OwnerCommand
 
 LOG = logging.getLogger("ramsei.discord.community")
 VIEW, SEND, HISTORY = 1024, 2048, 65536
@@ -223,7 +224,7 @@ class DiscordCommunity:
                 "/command room action — advanced room command\n"
                 "Examples for action: `quiet on`, `welcomes off`, `welcome default`, `language ar-eg`, "
                 "`play song name`, `pick 2`, `queue`, `np`, `imvu !admins`.\n"
-                  "**ramzydc:** type directly in a room channel to send to that IMVU room. Other viewers cannot send to IMVU.\n"
+                  "**ramzydc:** type text or any IMVU bot command directly in its room channel. Examples: `!boot Username`, `!addadmin Username`, `!addmod Username`, `!play song`, `!help`. Admins apply to this room; Mods apply globally. Other viewers cannot send to IMVU.\n"
                   "Every room log also has **Reply to IMVU** and **Room Controls** buttons. "
                 "Song searches have selection buttons.\n"
                 "VCOIN tickets are private. Verify the receipt in IMVU Wallet before submitting its reference.")
@@ -502,16 +503,28 @@ class DiscordCommunity:
                     self.last_content_notice = time.monotonic()
                 return
             text = str(message.get("content") or "").strip()
-            if (not text or len(text) > 430 or text.startswith(("*", "/", "!"))
+            if (not text or len(text) > 430 or text.startswith(("*", "/"))
                     or any(ord(c) < 32 and c != "\n" for c in text) or message.get("attachments")):
-                await reply("Send plain text, 1-430 characters. Use Room Controls or /command for bot commands; attachments aren't forwarded.")
+                await reply("Send text or a !command, 1-430 characters. Attachments and raw IMVU actions are not forwarded.")
                 return
             entry = self.bridge.manager.rooms.get(room)
             if not entry or not entry[0].connected or not entry[0].chat_ready:
                 await reply("This IMVU room is reconnecting. Nothing was sent.")
                 return
+            bot = entry[0]
+            picking = text.isdecimal() and len(text) <= 2 and OWNER_ID in getattr(bot, "song_choices", {})
+            if text.startswith("!") or picking:
+                if any(ord(c) < 32 for c in text):
+                    await reply("Send one bot command per message, without line breaks.")
+                    return
+                if bot.commands.full():
+                    await reply("This room's command queue is full. Please try again shortly.")
+                    return
+                bot.commands.put_nowait(OwnerCommand(room, text))
+                await reply("Owner command queued for this IMVU room; results appear in this room log.")
+                return
             try:
-                if not await entry[0].say(text):
+                if not await bot.say(text):
                     await reply("IMVU did not accept the message. Nothing was queued for later.")
             except (RuntimeError, OSError, aiohttp.ClientError, asyncio.TimeoutError):
                 await reply("Could not send to IMVU. Check the room connection before trying again.")
@@ -618,3 +631,4 @@ class DiscordCommunity:
         for task in self.interactions:
             task.cancel()
         await asyncio.gather(*self.interactions, return_exceptions=True)
+

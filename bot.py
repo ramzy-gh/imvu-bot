@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 from yarl import URL
 from personality import ALIASES, Social
-from permissions import OWNER_ID, Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normalize_management_message, canonical_management_command
+from permissions import OwnerCommand, REMOTE_OWNER_ROOM, actor_present, OWNER_ID, Permissions, MANAGEMENT_COMMANDS, ROOM_COMMANDS, normalize_management_message, canonical_management_command
 from identity import resolve_username, UserLookupError
 from state_store import StateStore
 from wardrobe import load_named_outfit, OutfitError
@@ -1246,13 +1246,13 @@ class Bot:
         return re.fullmatch(r"[0-9٠-٩]{1,2}", text.strip()) is not None
 
     async def queue_song(self, uid, url):
-        if uid not in self.members or not self.allowed_in_room(uid):
+        if not actor_present(self, uid) or not self.allowed_in_room(uid):
             return False
         if self.radio.queue.full():
             await self.say("The music queue is full. Please try later.")
             return False
         track = await asyncio.wait_for(self.radio.lookup(url), self.radio.LOOKUP_TIMEOUT)
-        if uid not in self.members or not self.allowed_in_room(uid):
+        if not actor_present(self, uid) or not self.allowed_in_room(uid):
             return False
         if self.radio.queue.full():
             await self.say("The music queue is full. Please try later.")
@@ -1303,7 +1303,7 @@ class Bot:
             await self.queue_song(uid, query)
             return
         choices = await self.radio.search(query)
-        if uid not in self.members or not self.allowed_in_room(uid):
+        if not actor_present(self, uid) or not self.allowed_in_room(uid):
             return
         if len(choices) == 1:
             await self.queue_song(uid, choices[0]["url"])
@@ -1311,7 +1311,7 @@ class Bot:
         await self.offer_song_choices(uid, query, choices)
 
     async def offer_song_choices(self, uid, query, choices):
-        if uid not in self.members or not self.allowed_in_room(uid):
+        if not actor_present(self, uid) or not self.allowed_in_room(uid):
             return
         now = time.monotonic()
         self.song_choices = OrderedDict((key, value) for key, value in self.song_choices.items() if value[0] > now)
@@ -1334,13 +1334,18 @@ class Bot:
 
     async def command_worker(self):
         while True:
-            uid, text, verified = await self.commands.get()
+            command = await self.commands.get()
+            uid, text, verified = command
+            remote = isinstance(command, OwnerCommand) and command.room == self.room and uid == OWNER_ID and verified
+            token = REMOTE_OWNER_ROOM.set(self.room if remote else None)
             try:
                 text = normalize_management_message(text)
                 parts = text.split(maxsplit=1)
                 cmd = parts[0] if parts else ""
                 query = parts[1] if len(parts) > 1 else ""
                 cmd = ALIASES.get(cmd.lower(), cmd.lower())
+                if remote:
+                    LOG.info("Discord owner command: room=%s command=%s", self.room, cmd)
                 if not self.allowed_in_room(uid):
                     continue
                 if self.is_song_number(text) and uid in self.song_choices:
@@ -1349,9 +1354,16 @@ class Bot:
                     await asyncio.wait_for(self.pick_song(uid, text), 100)
                     continue
                 if cmd not in {"!play", "!queue", "!np", "!skip", "!stop", "!help", "!radio", "!move", "!boot"} | MANAGEMENT_COMMANDS | ROOM_COMMANDS:
+                    if remote:
+                        if self.social.interested(text, uid) and not self.social.inbox.full():
+                            self.social.inbox.put_nowait((uid, text))
+                        else:
+                            await self.say("Unknown command. Use !help for available commands.")
                     continue
                 now = time.monotonic()
                 if now - self.cooldowns.get(uid, -1000) < 5:
+                    if remote:
+                        await self.say("Please wait five seconds between bot commands, then try again.")
                     continue
                 self.cooldowns[uid] = now
                 if len(self.cooldowns) > 500:
@@ -1416,6 +1428,7 @@ class Bot:
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self.say("Could not complete that request. Try another song; the bot is still running."), 10)
             finally:
+                REMOTE_OWNER_ROOM.reset(token)
                 self.commands.task_done()
 
     async def run(self):
@@ -1565,4 +1578,5 @@ if __name__ == "__main__":
         # Deliberately avoid tracebacks containing authentication or signed media URLs.
         LOG.error("Startup stopped: %s", str(error) if isinstance(error, RuntimeError) else type(error).__name__)
         sys.exit(1)
+
 

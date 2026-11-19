@@ -450,8 +450,8 @@ class DiscordBridge:
                     raise ValueError("Use !imvu ROOM_ID !command arguments.")
                 if not bot.connected or not bot.chat_ready or bot.commands.full():
                     raise ValueError("Room is reconnecting or busy.")
-                from permissions import OWNER_ID
-                bot.commands.put_nowait((OWNER_ID, body, True))
+                from permissions import OwnerCommand
+                bot.commands.put_nowait(OwnerCommand(room, body))
                 await self.send(self.header(room) + "\nOwner command queued; results appear in the room log.")
             elif cmd == "!say":
                 if (not body or len(body) > 430 or body.startswith(("*", "/", "!"))
@@ -610,3 +610,4 @@ class DiscordBridge:
 
     def snapshot(self):
         return {"state": self.state, "pending_messages": len(self.outbox), "dropped_messages": self.dropped}
+
