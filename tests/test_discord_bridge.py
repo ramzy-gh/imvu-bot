@@ -77,13 +77,57 @@ class DiscordTests(unittest.IsolatedAsyncioTestCase):
         self.second.say.assert_not_awaited()
         self.bridge.send.assert_not_awaited()
 
-    async def test_direct_chat_rejects_commands_attachments_and_disconnected_room(self):
+    async def test_direct_chat_rejects_actions_attachments_and_disconnected_room(self):
         community = self.community()
-        for i, change in enumerate(({"content": "!addadmin attacker"}, {"content": "*msg SeatAssignment"},
+        for i, change in enumerate(({"content": "/raw"}, {"content": "*msg SeatAssignment"},
                                     {"content": "hello", "attachments": [{"url": "https://test"}]})):
             await community.room_message(self.community_message(id=str(i), **change))
         self.second.connected = False
         await community.room_message(self.community_message())
+        self.second.say.assert_not_awaited()
+
+    async def test_owner_commands_route_only_to_mapped_room_and_deduplicate(self):
+        from permissions import OwnerCommand, OWNER_ID
+        community = self.community()
+        for i, text in enumerate(("!boot Guest_Target", "!addadmin User2", "!addmod User3", "!language en", "!play song")):
+            message = self.community_message(id=str(i), content=text)
+            await community.room_message(message)
+            await community.room_message(message)
+            item = self.second.commands.get_nowait()
+            self.assertIsInstance(item, OwnerCommand)
+            self.assertEqual(item, (OWNER_ID, text, True))
+            self.assertEqual(item.room, "123-2")
+        self.assertTrue(self.second.commands.empty())
+        self.assertTrue(self.first.commands.empty())
+        self.second.say.assert_not_awaited()
+
+    async def test_nonowner_command_never_gets_owner_marker(self):
+        community = self.community()
+        await community.room_message(self.community_message(content="!addmod User3", author={"id": "666666666", "username": "ramzydc"}))
+        self.assertTrue(self.second.commands.empty())
+        self.assertEqual(self.bridge.send.await_args.args[0], DENIED)
+
+    async def test_command_busy_disconnected_multiline_and_attachments_fail_closed(self):
+        community = self.community()
+        for i, changes in enumerate(({"content": "!boot x\n!addmod y"},
+                {"content": "!addadmin x", "attachments": [{"id": "1"}]})):
+            await community.room_message(self.community_message(id=str(i), **changes))
+        self.assertTrue(self.second.commands.empty())
+        self.second.commands = asyncio.Queue(maxsize=1)
+        self.second.commands.put_nowait("occupied")
+        await community.room_message(self.community_message(id="busy", content="!addmod x"))
+        self.assertIn("queue is full", self.bridge.send.await_args.args[0])
+        self.second.commands.get_nowait()
+        self.second.connected = False
+        await community.room_message(self.community_message(id="offline", content="!boot x"))
+        self.assertTrue(self.second.commands.empty())
+
+    async def test_song_selection_uses_owner_command_only_when_pending(self):
+        from permissions import OWNER_ID, OwnerCommand
+        community = self.community()
+        self.second.song_choices = {OWNER_ID: (999999, [])}
+        await community.room_message(self.community_message(content="2"))
+        self.assertIsInstance(self.second.commands.get_nowait(), OwnerCommand)
         self.second.say.assert_not_awaited()
 
     async def test_disabled_content_access_does_not_send_empty_content(self):
@@ -604,3 +648,4 @@ class DiscordTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent["components"][0]["components"][0]["disabled"])
         with self.assertRaises(ValueError):
             await community.confirm_order("0123456789abcdef", "", "wallet-123")
+

@@ -30,6 +30,42 @@ class BootTests(unittest.IsolatedAsyncioTestCase):
         self.bot.api = AsyncMock(side_effect=api)
         self.resolve = self.enterContext(patch('room_moderation.resolve_username', AsyncMock(return_value=('555', 'Guest_Target'))))
 
+    async def test_remote_owner_can_boot_without_physical_presence(self):
+        from permissions import REMOTE_OWNER_ROOM
+        self.bot.members.remove(OWNER_ID)
+        token = REMOTE_OWNER_ROOM.set(self.bot.room)
+        try:
+            await boot_user(self.bot, OWNER_ID, True, "Guest_Target")
+        finally:
+            REMOTE_OWNER_ROOM.reset(token)
+        self.assertTrue(any(c.args[0] == "DELETE" for c in self.bot.api.await_args_list))
+
+    async def test_remote_owner_still_requires_native_bot_permission(self):
+        from permissions import REMOTE_OWNER_ROOM
+        self.bot.members.remove(OWNER_ID)
+        self.mods.clear()
+        token = REMOTE_OWNER_ROOM.set(self.bot.room)
+        try:
+            await boot_user(self.bot, OWNER_ID, True, "Guest_Target")
+        finally:
+            REMOTE_OWNER_ROOM.reset(token)
+        self.assert_no_boot()
+
+    async def test_remote_marker_cannot_authorize_other_actor_or_other_room(self):
+        from permissions import REMOTE_OWNER_ROOM
+        self.bot.members.difference_update({OWNER_ID, "111"})
+        token = REMOTE_OWNER_ROOM.set(self.bot.room)
+        try:
+            await boot_user(self.bot, "111", True, "Guest_Target")
+        finally:
+            REMOTE_OWNER_ROOM.reset(token)
+        token = REMOTE_OWNER_ROOM.set("999-1")
+        try:
+            await boot_user(self.bot, OWNER_ID, True, "Guest_Target")
+        finally:
+            REMOTE_OWNER_ROOM.reset(token)
+        self.assert_no_boot()
+
     def assert_no_boot(self):
         self.assertFalse(any(c.args[0] == 'DELETE' for c in self.bot.api.await_args_list))
         self.assertFalse(any(c.args[0].startswith('*') for c in self.bot.say.await_args_list))
@@ -111,3 +147,4 @@ class BootTests(unittest.IsolatedAsyncioTestCase):
             API + '/room/room-456-1/moderators/user-555']}}}}
         with self.assertRaises(ValueError):
             await native_moderators(self.bot)
+

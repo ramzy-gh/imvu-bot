@@ -32,6 +32,23 @@ class SongChoices(unittest.IsolatedAsyncioTestCase):
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
 
+    async def test_remote_owner_music_works_without_presence_and_context_does_not_leak(self):
+        from permissions import OwnerCommand, OWNER_ID
+        worker = asyncio.create_task(self.bot.command_worker())
+        try:
+            for text in ("!play artist", "2"):
+                self.bot.commands.put_nowait(OwnerCommand(self.bot.room, text))
+                await asyncio.wait_for(self.bot.commands.join(), 2)
+            self.assertEqual(self.radio.queue.qsize(), 1)
+            self.radio.lookup.reset_mock()
+            self.bot.cooldowns.clear()
+            self.bot.commands.put_nowait((OWNER_ID, "!play https://example.test/song", True))
+            await asyncio.wait_for(self.bot.commands.join(), 2)
+            self.radio.lookup.assert_not_awaited()
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
     async def test_search_then_immediate_number_and_duplicate(self):
         await self.run_commands(("1", "!play billie eilish"), ("1", "3"), ("1", "3"))
         self.radio.search.assert_awaited_once_with("billie eilish")
@@ -136,3 +153,4 @@ class SearchResults(unittest.IsolatedAsyncioTestCase):
         for query in ("https://example.com/audio", "a\nb", "a" * 251):
             with self.assertRaises(ValueError):
                 Radio.lookup_target(query)
+

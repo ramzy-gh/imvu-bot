@@ -38,6 +38,40 @@ class RoomManagementTests(unittest.IsolatedAsyncioTestCase):
         bot.members = {OWNER_ID, "123"}
         return bot
 
+    async def test_remote_owner_worker_controls_room_without_avatar_and_context_resets(self):
+        from permissions import OwnerCommand, REMOTE_OWNER_ROOM
+        source = await self.source()
+        source.members.remove(OWNER_ID)
+        source.commands.put_nowait(OwnerCommand(source.room, "!join 123-1"))
+        await asyncio.wait_for(source.commands.join(), 2)
+        self.assertIn("123-1", self.manager.rooms)
+        self.assertIsNone(REMOTE_OWNER_ROOM.get())
+        source.cooldowns.clear()
+        source.commands.put_nowait((OWNER_ID, "!join 123-2", True))
+        await asyncio.wait_for(source.commands.join(), 2)
+        self.assertNotIn("123-2", self.manager.rooms)
+
+    async def test_owner_marker_for_other_room_does_not_bypass_presence(self):
+        from permissions import OwnerCommand
+        source = await self.source()
+        source.members.remove(OWNER_ID)
+        source.commands.put_nowait(OwnerCommand("999-1", "!join 123-1"))
+        await asyncio.wait_for(source.commands.join(), 2)
+        self.assertNotIn("123-1", self.manager.rooms)
+
+    async def test_remote_owner_admin_and_mod_commands_use_real_permission_handler(self):
+        from permissions import OwnerCommand
+        source = await self.source()
+        source.members.remove(OWNER_ID)
+        with patch("bot.resolve_username", AsyncMock(return_value=("555", "Guest_Target"))):
+            for command in ("!addadmin Guest_Target", "!addmod Guest_Target"):
+                source.cooldowns.clear()
+                source.commands.put_nowait(OwnerCommand(source.room, command))
+                await asyncio.wait_for(source.commands.join(), 2)
+        self.assertTrue(self.manager.permissions.is_admin("555", source.room))
+        self.assertTrue(self.manager.permissions.is_mod("555"))
+        self.assertFalse(self.manager.permissions.is_admin("555", "999-1"))
+
     async def test_owner_joins_from_one_room_and_leaves_it_from_another(self):
         main = await self.source()
         await self.manager.chat_command(main, OWNER_ID, True, "!join",
@@ -222,3 +256,4 @@ class RoomManagementTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 room_id(value)
         self.assertEqual(normalize_management_message("/join 123-1"), "!join 123-1")
+
