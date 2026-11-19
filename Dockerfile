@@ -6,7 +6,7 @@ ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1 PORT=3000
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py personality.py permissions.py identity.py state_store.py ./
-COPY offline_chat.py offline_seed.txt ./
+COPY offline_chat.py offline_seed.txt trivia.py ./
 COPY wardrobe.py ./
 COPY movement.py ./
 COPY telegram_bridge.py ./
@@ -24,4 +24,5 @@ RUN sed -i 's/\r$//' /usr/local/bin/ramsei-entrypoint && chmod 755 /usr/local/bi
 ENTRYPOINT ["/usr/local/bin/ramsei-entrypoint"]
 EXPOSE 3000
 CMD ["python", "bot.py"]
+
 

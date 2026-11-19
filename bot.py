@@ -765,7 +765,7 @@ class Bot:
         self.say_lock = asyncio.Lock()
         from room_language import RoomSpeech
         self.speech = RoomSpeech(self.room_language)
-        self.social = Social(self.say, allowed=self.allowed_in_room, language_policy=self.room_language, chat_say=self.say_chat)
+        self.social = Social(self.say, allowed=self.allowed_in_room, language_policy=self.room_language, chat_say=self.say_chat, room=self.room)
         self.social.quiet_policy = lambda: self.room_preferences()["quiet"]
 
     def allowed_in_room(self, uid):

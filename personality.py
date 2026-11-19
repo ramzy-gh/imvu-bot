@@ -9,6 +9,7 @@ import unicodedata
 from collections import OrderedDict
 import aiohttp
 from offline_chat import OfflineChat
+from trivia import TriviaDeck, CATEGORIES, ALIASES as TRIVIA_ALIASES
 
 LOG = logging.getLogger("ramsei.ai")
 
@@ -26,23 +27,13 @@ def normalize_answer(text):
     return " ".join(normalize(text).strip(" .!?،؟؛…").split())
 
 
-ALIASES = {"!games": "!game", "!شغل": "!play", "!طابور": "!queue", "!الاغنية": "!np",
+ALIASES = {"!games": "!game", "!trivia": "!game", "!تلميح": "!hint", "!تخطي": "!skipgame", "!شغل": "!play", "!طابور": "!queue", "!الاغنية": "!np",
            "!عدي": "!skip", "!وقف": "!stop", "!مساعدة": "!help",
            "!لعبة": "!game", "!تخمين": "!guess", "!جاوب": "!answer",
            "!نكتة": "!joke", "!حظ": "!fortune", "!تحدي": "!dare",
            "!نتيجة": "!scores", "!اسال": "!ask", "!اللغة": "!language",
            "!اللغه": "!language", "!الرومات": "!rooms", "!راديو": "!radio", "!تحرك": "!move"}
 
-QUESTIONS = [
-    ("إيه الحاجة اللي ليها سنان ومش بتعض؟ 🦷", {"المشط", "مشط"}),
-    ("حاجة كل ما تاخد منها تكبر.. إيه هي؟ 🤔", {"الحفرة", "حفره", "الحفره"}),
-    ("عاصمة مصر إيه يا أبطال؟ 🇪🇬", {"القاهرة", "قاهره", "القاهره", "cairo"}),
-    ("كام دقيقة في ساعتين؟ ⏰", {"120", "١٢٠"}),
-    ("الكشري بيتقدم مع صلصة وإيه كمان؟ قول حاجة واحدة 😋", {"دقة", "دقه", "الدقه", "شطة", "شطه", "الشطه"}),
-    ("إيه الكوكب المشهور بالكوكب الأحمر؟ 🪐", {"المريخ", "مريخ", "mars"}),
-    ("حاجة بتكتب ومش بتقرا.. إيه هي؟ ✍️", {"القلم", "قلم"}),
-    ("لو معاك ٣ تفاحات وأخدت منهم ٢، بقى معاك كام؟ 🍎", {"2", "٢", "اتنين", "اثنين"}),
-]
 JOKES = [
     "واحد اشترى سرير ذكي.. بقى يصحيه يقوله: قوم يا نجم القسط مستنيك 😂🛏️",
     "الواي فاي عندي رومانسي أوي.. كل شوية يقولّي اتصالنا ضعيف 💔📶😂",
@@ -56,13 +47,6 @@ DARES = ["اوصف يومك بتلات إيموجيز بس 😂👇", "قول ا
 FORTUNES = ["حاسس إن فيه أكلة حلوة في مستقبلك القريب 😋✨", "حظك النهارده محتاج شاحن وقهوة ☕🔋😂",
             "المود هيظبط بأغنية حلوة وصحبة ألطف 🎶💛", "النجوم بتقول اقفل المنبه وكمل نوم.. بهزر متتأخرش 😂⏰"]
 
-EN_QUESTIONS = [
-    ("What has teeth but cannot bite? 🦷", {"comb", "a comb"}),
-    ("What gets bigger the more you take away? 🤔", {"hole", "a hole"}),
-    ("What is Egypt's capital? 🇪🇬", {"cairo"}),
-    ("How many minutes are in two hours? ⏰", {"120"}),
-    ("Which planet is called the Red Planet? 🪐", {"mars"}),
-]
 EN_JOKES = ["My Wi-Fi and I need therapy. We keep losing our connection 😂📶",
     "I went to the gym once. My muscles asked if we'd met before 😂💪",
     "I'm not late replying. I'm building suspense 😂🎬"]
@@ -89,12 +73,13 @@ def reply_language(text, previous="en"):
 
 
 class Social:
-    def __init__(self, say, allowed=None, language_policy=None, chat_say=None):
+    def __init__(self, say, allowed=None, language_policy=None, chat_say=None, room=None):
         self.say = say
         self.chat_say = chat_say or say
         self.language_policy = language_policy or (lambda: "auto")
         self.allowed = allowed or (lambda uid: True)
         self.game = None
+        self.trivia = TriviaDeck(room)
         self.scores = OrderedDict()
         self.cooldowns = {}
         self.history = OrderedDict()
@@ -194,7 +179,7 @@ class Social:
     def interested(self, text, uid=None):
         cmd = text.partition(" ")[0].lower()
         cmd = ALIASES.get(cmd, cmd)
-        return bool(NAMES.search(text) or cmd in {"!game", "!guess", "!answer", "!joke", "!fortune", "!dare", "!scores", "!ask"}
+        return bool(NAMES.search(text) or cmd in {"!game", "!guess", "!answer", "!joke", "!fortune", "!dare", "!scores", "!ask", "!hint", "!skipgame"}
                     or (self.game and not text.startswith(("!", "*")) and len(text) < 70) or self.followup(uid, text))
 
     async def check_answer(self, uid, text):
@@ -379,6 +364,13 @@ class Social:
         if len(self.cooldowns) > 300:
             self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < 60}
         if cmd in {"!game", "!guess"}:
+            category_arg = normalize_answer(arg)
+            if cmd == "!game" and category_arg in {"help", "categories", "مساعدة", "مساعده", "اقسام"}:
+                await self.say("🎲 !game | !game علوم / جغرافيا / ألغاز / معلومات / حساب | !hint تلميح | !skipgame تخطي (صاحب الجولة)" if language == "ar" else "🎲 !game | !game science / geography / riddles / culture / math | !hint | !skipgame (round starter only)")
+                return
+            if cmd == "!game" and category_arg not in TRIVIA_ALIASES and category_arg not in CATEGORIES:
+                await self.say("القسم ده مش موجود. اكتب !game help للأقسام 🎲" if language == "ar" else "Unknown category. Use !game help for categories 🎲")
+                return
             if self.game:
                 await self.say("فيه جولة شغالة لسه يا نجم! 🎲 جاوب عليها الأول 😄" if language == "ar" else "There's already a round in progress! 🎲 Try answering it first 😄")
                 return
@@ -387,10 +379,43 @@ class Social:
                 self.game = {"kind": "number", "answer": number, "display": str(number), "expires": now + 120}
                 await self.say("خبيت رقم من ١ لـ ٣٠ 🤫🎲 اكتب تخمينك في الشات وأنا أقولك أعلى ولا أقل! معاكوا دقيقتين." if language == "ar" else "I'm thinking of a number from 1 to 30 🤫🎲 Guess in chat! I'll say higher or lower. You've got two minutes.")
             else:
-                question, answers = random.choice(QUESTIONS if language == "ar" else EN_QUESTIONS)
-                self.game = {"kind": "quiz", "answers": {normalize_answer(a) for a in answers},
-                             "display": sorted(answers)[0], "expires": now + 90}
-                await self.say(question + (" | أول إجابة صح تكسب نقطة! 🏆" if language == "ar" else " | First correct answer wins a point! 🏆"))
+                category = TRIVIA_ALIASES.get(category_arg, category_arg)
+                question = await self.trivia.next(category)
+                lang = "ar" if language == "ar" else "en"
+                label = CATEGORIES[question["category"]] if lang == "ar" else question["category"].title()
+                self.game = {"kind": "quiz", "answers": {normalize_answer(a) for a in question["answers"]},
+                             "display": question["display_" + lang], "expires": time.monotonic() + 90,
+                             "starter": uid, "language": lang, "hinted": False, "question_id": question["id"]}
+                await self.say("🎲 [" + label + "] " + question[lang] +
+                    (" | 90 ثانية، أول إجابة صح تكسب! 🏆 !hint للتلميح" if lang == "ar" else " | 90 seconds, first correct answer wins! 🏆 !hint for a hint"))
+        elif cmd == "!hint":
+            game = self.game
+            if not game or game["kind"] != "quiz":
+                await self.say("ابدأ سؤال بـ !game الأول 🎲" if language == "ar" else "Start a trivia round with !game first 🎲")
+            elif game.get("hinted"):
+                await self.say("التلميح اتقال خلاص 😄" if language == "ar" else "The hint has already been given 😄")
+            else:
+                game["hinted"] = True
+                answer = game["display"]
+                if language == "ar" and answer.startswith("ال") and len(answer) > 2:
+                    answer = answer[2:]
+                if answer.isdecimal():
+                    hint = (f"الإجابة رقم من {len(answer)} خانة" if language == "ar" else f"The answer has {len(answer)} digit(s)")
+                    if len(answer) > 1:
+                        hint += (" وبيبدأ بـ " if language == "ar" else " and starts with ") + answer[0]
+                else:
+                    hint = (("بتبدأ بـ «" if language == "ar" else "Starts with «") + answer[0] + "» | " +
+                            str(len(answer.split())) + (" كلمة" if language == "ar" else " word(s)"))
+                await self.say("💡 " + hint)
+        elif cmd == "!skipgame":
+            if not self.game or self.game["kind"] != "quiz":
+                await self.say("مفيش سؤال شغال دلوقتي. !game 🎲" if language == "ar" else "No trivia round is active. !game 🎲")
+            elif self.game.get("starter") != uid:
+                await self.say("صاحب الجولة بس يقدر يتخطاها 😄" if language == "ar" else "Only the round starter can skip it 😄")
+            else:
+                answer = self.game["display"]
+                self.game = None
+                await self.say(("الجولة اتخطت. الإجابة: " if language == "ar" else "Round skipped. Answer: ") + answer + " | !game")
         elif cmd == "!joke":
             await self.say(random.choice(JOKES if language == "ar" else EN_JOKES))
         elif cmd == "!dare":
@@ -418,3 +443,4 @@ class Social:
                 await self.say("اتلخبطت ثانية يا نجم 😅 جرّب تاني!" if self.languages.get(uid) == "ar" else "I hit a connection problem 😅 Try again shortly!")
             finally:
                 self.inbox.task_done()
+
